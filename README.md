@@ -10,6 +10,7 @@ A robust, modular, and fast ZSH script designed to organize large media collecti
 - **Backup Context**: Maintains organization by creating subfolders based on a user-defined "Backup ID".
 - **Safety First**: Features a **Dry Run** mode to preview actions without modifying files, and comprehensive logging of all operations.
 - **Interactive CLI**: A user-friendly, color-coded menu interface designed for terminals like [Ghostty](https://ghostty.org/).
+- **External Volume Detection**: Automatically detects connected external drives in `/Volumes/` and presents them in an interactive menu for easy source selection (or fallback to manual entry).
 
 ## Prerequisites
 
@@ -40,6 +41,13 @@ Simply run the script without arguments for a guided setup:
 ```bash
 ./organize.zsh
 ```
+
+**New: Automatic External Volume Detection**  
+When running interactively, the script will automatically scan `/Volumes/` for connected external drives (excluding macOS system volumes like "Macintosh HD", "Recovery", etc.). It will present an interactive menu showing:
+- Volume name and path
+- Available free space
+- Option to use the entire volume as source, or navigate to a subdirectory
+- "Manual Entry" fallback for typing or dragging a path
 
 ### CLI Mode (Non-interactive)
 You can run the script in non-interactive mode by providing arguments:

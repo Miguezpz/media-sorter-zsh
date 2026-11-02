@@ -101,10 +101,9 @@ get_user_config() {
     print_header "FILE ORGANIZER & DUPLICATE FINDER"
     print_info "macOS M2 Edition - ZSH + jdupes + exiftool"
 
-    # Source directory
+    # Source directory - with external volume detection
     print_section "SOURCE DIRECTORY"
-    print_info "Drag folder from Finder into terminal, or type path"
-    read_path "Source directory" SOURCE_DIR
+    select_source_directory SOURCE_DIR
 
     # Destination directory
     print_section "DESTINATION DIRECTORY"

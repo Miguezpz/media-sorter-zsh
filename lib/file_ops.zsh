@@ -151,6 +151,45 @@ scan_files() {
     find "$source_dir" -type f -print0 2>/dev/null
 }
 
+# ============================================================================
+# Volume Detection
+# ============================================================================
+
+# Detect external volumes mounted in /Volumes/
+# Returns array of volume paths (excluding system volumes)
+detect_external_volumes() {
+    local -a volumes=()
+
+    # List directories in /Volumes excluding system volumes
+    for vol in /Volumes/*(/N); do
+        local vol_name="${vol##*/}"
+
+        # Skip macOS system volumes
+        if [[ "$vol_name" =~ ^(Macintosh HD|Recovery|Preboot|VM|Update|Data)$ ]]; then
+            continue
+        fi
+
+        # Check if it's a mounted external volume and writable
+        if [[ -d "$vol" && -w "$vol" ]]; then
+            volumes+=("$vol")
+        fi
+    done
+
+    # Return volumes as newline-separated for array assignment
+    for vol in "${volumes[@]}"; do
+        echo "$vol"
+    done
+}
+
+# Get volume info (name, path, free space)
+get_volume_info() {
+    local vol_path="$1"
+    local vol_name="${vol_path##*/}"
+    local free_space=$(df -h "$vol_path" 2>/dev/null | awk 'NR==2 {print $4}')
+
+    echo "$vol_name|$vol_path|${free_space:-Unknown}"
+}
+
 # Get file size in bytes
 get_file_size() {
     local filepath="$1"

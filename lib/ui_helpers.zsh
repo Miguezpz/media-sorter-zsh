@@ -59,20 +59,20 @@ print_header() {
 
 print_section() {
     local text="$1"
-    printf "\n${COLORS[BOLD]}${COLORS[BLUE]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[GEAR]}" "$text"
-    printf "${COLORS[DIM]}%s${COLORS[RESET]}\n" "$(printf '─%.0s' {1..60})"
+    printf "\n${COLORS[BOLD]}${COLORS[BLUE]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[GEAR]}" "$text" >&2
+    printf "${COLORS[DIM]}%s${COLORS[RESET]}\n" "$(printf '─%.0s' {1..60})" >&2
 }
 
 print_info() {
-    printf "${COLORS[CYAN]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[INFO]}" "$1"
+    printf "${COLORS[CYAN]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[INFO]}" "$1" >&2
 }
 
 print_success() {
-    printf "${COLORS[GREEN]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[CHECK]}" "$1"
+    printf "${COLORS[GREEN]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[CHECK]}" "$1" >&2
 }
 
 print_warn() {
-    printf "${COLORS[YELLOW]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[WARNING]}" "$1"
+    printf "${COLORS[YELLOW]}%s %s${COLORS[RESET]}\n" "${SYMBOLS[WARNING]}" "$1" >&2
 }
 
 print_error() {
@@ -206,21 +206,21 @@ select_menu() {
     local selected=0
     local key
 
-    print_section "$title"
+    print_section "$title" >&2
 
     for i in {1..${#options[@]}}; do
-        printf "  ${COLORS[DIM]}[%d]${COLORS[RESET]} %s\n" "$i" "${options[$i]}"
+        printf "  ${COLORS[DIM]}[%d]${COLORS[RESET]} %s\n" "$i" "${options[$i]}" >&2
     done
 
     while true; do
-        printf "${COLORS[CYAN]}Select [1-%d]: ${COLORS[RESET]}" "${#options[@]}"
+        printf "${COLORS[CYAN]}Select [1-%d]: ${COLORS[RESET]}" "${#options[@]}" >&2
         read -r key
 
         if [[ "$key" =~ ^[0-9]+$ ]] && (( key >= 1 && key <= ${#options[@]} )); then
             selected=$key
             break
         fi
-        print_error "Invalid selection"
+        print_error "Invalid selection" >&2
     done
 
     echo $selected
@@ -297,3 +297,68 @@ cleanup_spinner() {
     stop_spinner
 }
 trap cleanup_spinner EXIT INT TERM
+
+# ============================================================================
+# Volume Selection
+# ============================================================================
+
+# Interactive source directory selection with external volume detection
+# Usage: select_source_directory VAR_NAME
+# Sets the variable VAR_NAME to the selected path
+select_source_directory() {
+    local var_name="$1"
+
+    # Detect external volumes
+    local -a volumes=()
+    while IFS= read -r vol; do
+        [[ -n "$vol" ]] && volumes+=("$vol")
+    done < <(detect_external_volumes)
+
+    if [[ ${#volumes[@]} -gt 0 ]]; then
+        print_section "EXTERNAL VOLUMES DETECTED"
+        print_info "Select a volume, or choose 'Manual Entry' to type/drag a path"
+
+        local -a options=()
+        local -a volume_info=()
+
+        for vol in "${volumes[@]}"; do
+            local info=$(get_volume_info "$vol")
+            local vol_name="${info%%|*}"
+            local vol_path="${info#*|}"
+            vol_path="${vol_path%|*}"
+            local free_space="${info##*|}"
+
+            options+=("$vol_name ($vol_path) - ${free_space} free")
+            volume_info+=("$info")
+        done
+        options+=("Manual Entry (type or drag path)")
+
+        local choice
+        choice=$(select_menu "Select source directory" "${options[@]}")
+
+        if (( choice <= ${#volumes[@]} )); then
+            # User selected a volume
+            local selected_info="${volume_info[$choice]}"
+            local selected_vol="${selected_info#*|}"
+            selected_vol="${selected_vol%|*}"
+
+            if confirm "Use entire volume '$(basename "$selected_vol")' as source?" "Y"; then
+                eval "$var_name=\"$selected_vol\""
+                print_success "Source set to: $selected_vol"
+                return 0
+            else
+                # Let user navigate into the volume
+                read_path "Subdirectory in $(basename "$selected_vol") (or press Enter for root)" "$var_name" "$selected_vol"
+                return 0
+            fi
+        else
+            # Manual entry
+            read_path "Source directory" "$var_name"
+            return 0
+        fi
+    else
+        print_info "No external volumes detected. Using manual entry."
+        read_path "Source directory" "$var_name"
+        return 0
+    fi
+}
