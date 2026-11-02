@@ -171,6 +171,22 @@ get_user_config() {
     printf "  ${COLORS[BOLD]}Cleanup:${COLORS[RESET]}         %s\n" "$([[ $CLEANUP_ENABLED == true ]] && echo ON || echo OFF)"
     printf "  ${COLORS[BOLD]}Dry Run:${COLORS[RESET]}         %s\n" "$([[ $DRY_RUN == true ]] && echo ON || echo OFF)"
 
+    # Disk space summary
+    local free_dest=$(get_free_space_human "$DEST_ROOT")
+    printf "  ${COLORS[BOLD]}Free space at dest:${COLORS[RESET]} %s\n" "$free_dest"
+
+    local est_size=$(estimate_source_size "$SOURCE_DIR")
+    if [[ $est_size -gt 0 ]]; then
+        printf "  ${COLORS[BOLD]}Est. size:${COLORS[RESET]}      %s\n" "$(format_bytes $est_size)"
+        if [[ "$COPY_MODE" == "copy" ]]; then
+            local free_bytes=$(get_free_space_bytes "$DEST_ROOT")
+            local needed_bytes=$((est_size * 110 / 100))
+            if [[ $free_bytes -lt $needed_bytes ]]; then
+                printf "  ${COLORS[RED]}⚠ SPACE WARNING: Phased processing may be needed${COLORS[RESET]}\n"
+            fi
+        fi
+    fi
+
     if ! confirm "Proceed with this configuration?"; then
         print_info "Cancelled by user"
         exit 0
@@ -244,6 +260,27 @@ organize_files() {
     fi
 
     print_section "ORGANIZING FILES"
+
+    # Check disk space first
+    if ! check_disk_space "$SOURCE_DIR" "$DEST_ROOT" "$COPY_MODE"; then
+        print_warn "Insufficient disk space for single-pass operation"
+        print_info "Available: $(get_free_space_human "$DEST_ROOT")"
+        local est_size=$(estimate_source_size "$SOURCE_DIR")
+        print_info "Estimated needed: $(format_bytes $((est_size * 110 / 100))) (with 10% margin)"
+
+        if [[ "$COPY_MODE" == "copy" ]]; then
+            print_info "Enabling phased processing (copy + cleanup source after each phase)..."
+            if ! confirm "Proceed with phased processing?"; then
+                print_info "Operation cancelled"
+                return 0
+            fi
+            organize_files_phased "$SOURCE_DIR" "$DEST_ROOT" "$BACKUP_ID" "$RENAME_ENABLED"
+            return 0
+        else
+            # Move mode on same filesystem - no extra space needed
+            print_info "Move mode on same filesystem - proceeding without extra space"
+        fi
+    fi
 
     # Collect all files first (for progress bar)
     local -a all_files=()
@@ -491,13 +528,44 @@ validate_config() {
         ((errors++))
     fi
 
-    if [[ $errors -gt 0 ]]; then
-        exit 1
-    fi
-
     # Convert to absolute paths
     SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
     DEST_ROOT="$(mkdir -p "$DEST_ROOT" && cd "$DEST_ROOT" && pwd)"
+
+    # Validate source and destination are not the same or nested
+    local abs_source="$SOURCE_DIR"
+    local abs_dest="$DEST_ROOT"
+
+    if [[ "$abs_dest" == "$abs_source"* ]]; then
+        print_error "Destination cannot be inside source directory"
+        print_error "  Source:      $abs_source"
+        print_error "  Destination: $abs_dest"
+        ((errors++))
+    elif [[ "$abs_source" == "$abs_dest"* && "$abs_source" != "$abs_dest" ]]; then
+        print_error "Source cannot be inside destination directory"
+        print_error "  Source:      $abs_source"
+        print_error "  Destination: $abs_dest"
+        ((errors++))
+    elif [[ "$abs_source" == "$abs_dest" ]]; then
+        print_error "Source and destination cannot be the same directory"
+        print_error "  Path: $abs_source"
+        ((errors++))
+    fi
+
+    # Check if same filesystem
+    local src_dev=$(stat -f "%d" "$abs_source" 2>/dev/null || echo "")
+    local dest_dev=$(stat -f "%d" "$abs_dest" 2>/dev/null || echo "")
+    if [[ -n "$src_dev" && -n "$dest_dev" && "$src_dev" == "$dest_dev" ]]; then
+        print_warn "Source and destination are on the same filesystem"
+        print_warn "Moving files will be fast (rename), but copying will use extra space"
+        if ! confirm "Continue with same filesystem?"; then
+            ((errors++))
+        fi
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        exit 1
+    fi
 
     # Initialize log file
     LOG_FILE="$DEST_ROOT/management_log.txt"
