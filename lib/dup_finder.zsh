@@ -64,11 +64,15 @@ parse_jdupes_output() {
         local group_json
         group_json=$(jq ".matchSets[$i]" "$json_file")
 
-        # jdupes doesn't include hash in JSON by default, compute from first file
         local first_file
         first_file=$(echo "$group_json" | jq -r '.fileList[0].filePath')
+        
+        # Recuperar el hash directamente del JSON de jdupes, o recalcular si falla
         local hash
-        hash=$(md5 -q "$first_file" 2>/dev/null || echo "unknown")
+        hash=$(echo "$group_json" | jq -r '.fileList[0].fileHash // empty')
+        if [[ -z "$hash" || "$hash" == "null" ]]; then
+            hash=$(md5 -q "$first_file" 2>/dev/null || echo "unknown")
+        fi
 
         local size
         size=$(echo "$group_json" | jq -r '.fileSize')

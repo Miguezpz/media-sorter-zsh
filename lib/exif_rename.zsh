@@ -70,6 +70,8 @@ get_fs_date() {
 }
 
 # Generate unique filename in destination directory
+# If src_file is provided, checks for identical content to avoid duplicates
+# Sets global SOURCE_HASH to the source file's hash for reuse
 generate_unique_name() {
     local dest_dir="$1"
     local proposed_name="$2"
@@ -87,6 +89,7 @@ generate_unique_name() {
             dest_hash=$(md5 -q "$dest_dir/$final_name" 2>/dev/null)
             if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
                 # Same file, we'll skip at higher level
+                SOURCE_HASH="$src_hash"
                 echo "$final_name"
                 return 0
             fi
@@ -96,10 +99,18 @@ generate_unique_name() {
         final_name="${base}_${counter}.${ext}"
     done
 
+    # Calculate and cache hash for the source file if provided
+    if [[ -n "$src_file" ]]; then
+        SOURCE_HASH=$(md5 -q "$src_file" 2>/dev/null)
+    else
+        SOURCE_HASH=""
+    fi
+
     echo "$final_name"
 }
 
 # Main function: determine final filename for a file
+# Also sets global SOURCE_HASH for the processed file to avoid recalculation
 determine_filename() {
     local filepath="$1"
     local dest_dir="$2"

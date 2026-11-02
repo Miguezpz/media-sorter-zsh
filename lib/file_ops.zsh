@@ -4,12 +4,13 @@
 # ============================================================================
 
 # Category extensions mapping
+# Spanish folder names as per SPECIFICATION.md
 typeset -gA CATEGORIES
 CATEGORIES=(
-    images      "jpg jpeg png gif heic heif webp raw cr2 nef arw dng tiff tif bmp"
-    videos      "mp4 mov avi mkv m4v 3gp mpg mpeg wmv flv webm"
-    audio       "mp3 wav aac flac m4a ogg wma aiff aif"
-    documents   "pdf doc docx txt xls xlsx ppt pptx md rtf odt ods odp"
+    Imagenes    "jpg jpeg png gif heic heif webp raw cr2 nef arw dng tiff tif bmp"
+    Videos      "mp4 mov avi mkv m4v 3gp mpg mpeg wmv flv webm"
+    Audio       "mp3 wav aac flac m4a ogg wma aiff aif"
+    Documentos  "pdf doc docx txt xls xlsx ppt pptx md rtf odt ods odp"
 )
 
 # Get category for a file extension
@@ -30,15 +31,15 @@ categorize_file() {
     return 0
 }
 
-# Get category display name
+# Get category display name (used for display, returns the key since keys are Spanish names)
 get_category_display() {
     local category="$1"
     case "$category" in
-        images)      echo "Images" ;;
-        videos)      echo "Videos" ;;
-        audio)       echo "Audio" ;;
-        documents)   echo "Documents" ;;
-        *)           echo "Others" ;;
+        Imagenes)    echo "Imágenes" ;;
+        Videos)      echo "Videos" ;;
+        Audio)       echo "Audio" ;;
+        Documentos)  echo "Documentos" ;;
+        *)           echo "Otros" ;;
     esac
 }
 
@@ -95,6 +96,30 @@ copy_file() {
     fi
 }
 
+# Move file with progress logging
+move_file() {
+    local src="$1"
+    local dest="$2"
+    local log_file="$3"
+    local action="${4:-MOVE}"
+    local details="${5:-}"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_operation "$log_file" "$action" "$src" "$dest" "$details (DRY RUN)"
+        return 0
+    fi
+
+    # Move (copy + remove source)
+    if cp -p "$src" "$dest" 2>/dev/null && rm -f "$src" 2>/dev/null; then
+        log_operation "$log_file" "$action" "$src" "$dest" "$details"
+        return 0
+    else
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Move failed: $details"
+        # If copy succeeded but remove failed, we may have a duplicate
+        return 1
+    fi
+}
+
 # Log operation to management log
 log_operation() {
     local log_file="$1"
@@ -124,9 +149,10 @@ cleanup_empty_dirs() {
 
     print_info "Cleaning empty directories in source..."
 
-    # Find and remove empty directories (bottom-up)
-    while IFS= read -r -d '' dir; do
-        if [[ -d "$dir" ]] && [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+    # Usando el globbing ZSH recursivo inverso (/Nod = Null glob, Solo directorios, Ordernar por profundidad)
+    # Reemplazo de `find | sort -z` que es incompatible con macOS
+    for dir in "$source_dir"/**/*(/Nod); do
+        if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
             if [[ "$DRY_RUN" == "true" ]]; then
                 log_operation "$log_file" "CLEANUP" "$dir" "" "(DRY RUN)"
                 ((count++))
@@ -137,7 +163,7 @@ cleanup_empty_dirs() {
                 fi
             fi
         fi
-    done < <(find "$source_dir" -type d -print0 2>/dev/null | sort -z -r)
+    done
 
     print_success "Cleaned $count empty directories"
     echo "$count"
@@ -197,13 +223,13 @@ get_volume_info() {
 # Get free space in bytes for a path
 get_free_space_bytes() {
     local path="$1"
-    df -k "$path" 2>/dev/null | awk 'NR==2 {print $4 * 1024}'
+    /bin/df -k "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {print $4 * 1024}'
 }
 
 # Get free space in human readable format
 get_free_space_human() {
     local path="$1"
-    df -h "$path" 2>/dev/null | awk 'NR==2 {print $4}'
+    /bin/df -h "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {print $4}'
 }
 
 # Format bytes to human readable
@@ -281,6 +307,7 @@ process_chunk() {
     local dest_root="$2"
     local backup_id="$3"
     local rename_enabled="$4"
+    local copy_mode="${5:-copy}"
 
     for file in "${files_ref[@]}"; do
         # Skip if marked as duplicate to remove
@@ -314,7 +341,12 @@ process_chunk() {
         # Check if already exists at destination (same content)
         if [[ -f "$dest_path" ]]; then
             local src_hash dest_hash
-            src_hash=$(get_file_hash "$file")
+            # Use cached hash from generate_unique_name if available
+            if [[ -n "$SOURCE_HASH" ]]; then
+                src_hash="$SOURCE_HASH"
+            else
+                src_hash=$(get_file_hash "$file")
+            fi
             dest_hash=$(get_file_hash "$dest_path")
             if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
                 ((STAT_SKIPPED_EXIST++))
@@ -323,15 +355,32 @@ process_chunk() {
             fi
         fi
 
-        # Copy file
-        local details="hash=$(get_file_hash "$file")"
+        # Copy or Move file based on copy_mode
+        local details
+        # Use cached hash if available
+        if [[ -n "$SOURCE_HASH" ]]; then
+            details="hash=$SOURCE_HASH"
+        else
+            details="hash=$(get_file_hash "$file")"
+        fi
         if [[ "$rename_enabled" == "true" ]]; then
             local exif_date
             exif_date=$(get_exif_date "$file" 2>/dev/null || echo "none")
             details+=" exif=$exif_date"
         fi
 
-        if copy_file "$file" "$dest_path" "$LOG_FILE" "COPY" "$details"; then
+        local action="COPY"
+        local result=0
+        if [[ "$copy_mode" == "move" ]]; then
+            action="MOVE"
+            move_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
+            result=$?
+        else
+            copy_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
+            result=$?
+        fi
+
+        if [[ $result -eq 0 ]]; then
             ((STAT_COPIED++))
         else
             ((STAT_ERRORS++))
@@ -431,9 +480,10 @@ organize_files_phased() {
             print_warn "Available: $free_dest_human, Required: $needed_human"
 
             if [[ "$COPY_MODE" == "copy" ]]; then
-                print_info "Since we're in copy mode, we need to free space first."
-                print_info "Run the script in 'move' mode, or free space manually."
-                if ! confirm "Continue anyway? (may fail)"; then
+                print_info "Since we're in copy mode, phased processing will DELETE files from SOURCE after each phase to free space."
+                print_warn "This means your source files will be removed as they are copied!"
+                print_info "Alternative: Run the script in 'move' mode, or free space manually."
+                if ! confirm "Continue with phased processing (DELETE source files after copy)?"; then
                     print_error "Aborted by user"
                     return 1
                 fi
@@ -446,7 +496,7 @@ organize_files_phased() {
         local -a chunk=("${all_files[@]:processed:chunk_end-processed}")
 
         # Process chunk
-        process_chunk chunk "$dest_root" "$backup_id" "$rename_enabled"
+        process_chunk chunk "$dest_root" "$backup_id" "$rename_enabled" "$COPY_MODE"
 
         # If copy mode: remove processed files from source to free space
         if [[ "$COPY_MODE" == "copy" ]]; then

@@ -140,7 +140,7 @@ read_path() {
         # Convert to absolute path
         input="$(cd "$input" && pwd)" || return 1
 
-        eval "$var_name=\"$input\""
+        typeset -g "$var_name=$input"
         print_success "Set to: $input"
         return 0
     done
@@ -172,7 +172,7 @@ read_string() {
             continue
         fi
 
-        eval "$var_name=\"$input\""
+        typeset -g "$var_name=$input"
         print_success "Set to: $input"
         return 0
     done
@@ -270,6 +270,7 @@ select_multiple() {
 # Spinner for long operations
 spinner_pid=0
 start_spinner() {
+    setopt localoptions no_monitor
     local msg="$1"
     local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0

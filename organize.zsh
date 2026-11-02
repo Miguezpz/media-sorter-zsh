@@ -25,6 +25,7 @@ typeset -g DEST_ROOT=""
 typeset -g BACKUP_ID=""
 typeset -g MODE="full"          # full, duplicates, organize
 typeset -g COPY_MODE="copy"     # copy, move
+typeset -g SOURCE_HASH=""       # cache hash to avoid recalculation
 typeset -g RENAME_ENABLED=true
 typeset -g CLEANUP_ENABLED=true
 typeset -g DRY_RUN=false
@@ -82,6 +83,10 @@ check_dependencies() {
         print_info "Install with: brew install ${missing[*]}"
 
         if confirm "Install missing dependencies now?"; then
+            if ! command -v brew >/dev/null 2>&1; then
+                print_error "Homebrew no está instalado. Visita https://brew.sh/ para instalarlo primero."
+                exit 1
+            fi
             brew install "${missing[@]}"
             print_success "Dependencies installed"
         else
@@ -150,6 +155,21 @@ get_user_config() {
             CLEANUP_ENABLED=false
             print_info "Cleanup Empty Folders: OFF"
         fi
+    fi
+
+    # Copy vs Move mode
+    if [[ "$MODE" != "duplicates" ]]; then
+        local copy_mode_options=(
+            "Copy (preserve source, default)"
+            "Move (delete source after successful copy - SAVES SPACE)"
+        )
+        local copy_mode_choice
+        copy_mode_choice=$(select_menu "Copy or Move mode?" "${copy_mode_options[@]}")
+        case $copy_mode_choice in
+            1) COPY_MODE="copy" ;;
+            2) COPY_MODE="move" ;;
+        esac
+        print_success "Copy Mode: $COPY_MODE"
     fi
 
     if confirm "Dry Run (preview only, no changes)?" "N"; then
@@ -341,7 +361,12 @@ organize_files() {
         # Check if already exists at destination (same content)
         if [[ -f "$dest_path" ]]; then
             local src_hash dest_hash
-            src_hash=$(get_file_hash "$file")
+            # Use cached hash from generate_unique_name if available
+            if [[ -n "$SOURCE_HASH" ]]; then
+                src_hash="$SOURCE_HASH"
+            else
+                src_hash=$(get_file_hash "$file")
+            fi
             dest_hash=$(get_file_hash "$dest_path")
             if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
                 ((STAT_SKIPPED_EXIST++))
@@ -350,15 +375,32 @@ organize_files() {
             fi
         fi
 
-        # Copy file
-        local details="hash=$(get_file_hash "$file")"
+        # Copy or Move file based on COPY_MODE
+        local details
+        # Use cached hash if available
+        if [[ -n "$SOURCE_HASH" ]]; then
+            details="hash=$SOURCE_HASH"
+        else
+            details="hash=$(get_file_hash "$file")"
+        fi
         if [[ "$RENAME_ENABLED" == "true" ]]; then
             local exif_date
             exif_date=$(get_exif_date "$file" 2>/dev/null || echo "none")
             details+=" exif=$exif_date"
         fi
 
-        if copy_file "$file" "$dest_path" "$LOG_FILE" "COPY" "$details"; then
+        local action="COPY"
+        local result=0
+        if [[ "$COPY_MODE" == "move" ]]; then
+            action="MOVE"
+            move_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
+            result=$?
+        else
+            copy_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
+            result=$?
+        fi
+
+        if [[ $result -eq 0 ]]; then
             ((STAT_COPIED++))
         else
             ((STAT_ERRORS++))
@@ -450,6 +492,14 @@ parse_args() {
                 DRY_RUN=true
                 shift
                 ;;
+            --move)
+                COPY_MODE="move"
+                shift
+                ;;
+            --copy)
+                COPY_MODE="copy"
+                shift
+                ;;
             --no-interactive)
                 INTERACTIVE=false
                 shift
@@ -480,6 +530,8 @@ Options:
   --backup-id NAME      Backup identifier
   --mode MODE           Mode: full, duplicates, organize
   --dry-run             Preview only, no changes
+  --move                Move files instead of copying (deletes source after copy)
+  --copy                Copy files (default, preserves source)
   --no-interactive      Run without prompts (requires all args)
   --rename              Enable EXIF renaming
   --no-rename           Disable EXIF renaming
@@ -533,18 +585,18 @@ validate_config() {
     DEST_ROOT="$(mkdir -p "$DEST_ROOT" && cd "$DEST_ROOT" && pwd)"
 
     # Validate source and destination are not the same or nested
-    local abs_source="$SOURCE_DIR"
-    local abs_dest="$DEST_ROOT"
+    local abs_source="${SOURCE_DIR%/}/"
+    local abs_dest="${DEST_ROOT%/}/"
 
     if [[ "$abs_dest" == "$abs_source"* ]]; then
         print_error "Destination cannot be inside source directory"
-        print_error "  Source:      $abs_source"
-        print_error "  Destination: $abs_dest"
+        print_error "  Source:      $SOURCE_DIR"
+        print_error "  Destination: $DEST_ROOT"
         ((errors++))
     elif [[ "$abs_source" == "$abs_dest"* && "$abs_source" != "$abs_dest" ]]; then
         print_error "Source cannot be inside destination directory"
-        print_error "  Source:      $abs_source"
-        print_error "  Destination: $abs_dest"
+        print_error "  Source:      $SOURCE_DIR"
+        print_error "  Destination: $DEST_ROOT"
         ((errors++))
     elif [[ "$abs_source" == "$abs_dest" ]]; then
         print_error "Source and destination cannot be the same directory"
@@ -596,6 +648,8 @@ main() {
         if [[ -z "$SOURCE_DIR" ]]; then
             check_dependencies
             get_user_config
+            # Validate config after interactive input
+            validate_config
         else
             # Non-interactive but args provided
             validate_config
