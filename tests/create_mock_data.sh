@@ -5,7 +5,8 @@
 
 set -euo pipefail
 
-TEST_ROOT="/tmp/file_organizer_test_$(date +%s)"
+# Allow passing a custom test root or use default
+TEST_ROOT="${1:-/tmp/file_organizer_test_$(date +%s)}"
 SOURCE_DIR="$TEST_ROOT/source"
 DEST_DIR="$TEST_ROOT/dest"
 
@@ -14,6 +15,11 @@ print_success() { printf "\033[32m✓ %s\033[0m\n" "$1"; }
 print_warn() { printf "\033[33m⚠ %s\033[0m\n" "$1"; }
 
 print_info "Creating test data at: $TEST_ROOT"
+
+# Clean previous environment if exists
+rm -rf "$TEST_ROOT" 2>/dev/null || true
+mkdir -p "$SOURCE_DIR"
+mkdir -p "$DEST_DIR"
 
 # Create source structure simulating multiple phone backups
 mkdir -p "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE"
@@ -25,8 +31,6 @@ mkdir -p "$SOURCE_DIR/EmptyFolder1/EmptySubfolder"
 mkdir -p "$SOURCE_DIR/EmptyFolder2"
 
 # Create test files with various extensions
-# We'll create actual small files
-
 # Images
 echo "fake jpg content 1" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG"
 echo "fake jpg content 2" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0002.JPG"
@@ -83,14 +87,3 @@ else
 fi
 
 print_success "Test data created at: $SOURCE_DIR"
-print_info "Test structure:"
-find "$SOURCE_DIR" -type f | sort | while read f; do
-    printf "  %s\n" "${f#$SOURCE_DIR/}"
-done
-
-print_info "To run tests:"
-print_info "  cd /path/to/file-management"
-print_info "  ./organize.zsh"
-print_info "  Source: $SOURCE_DIR"
-print_info "  Dest:   $DEST_DIR"
-print_info "  Backup ID: TestBackup"
