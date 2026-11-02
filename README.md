@@ -23,7 +23,7 @@ brew install jdupes exiftool jq
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yourusername/media-sorter-zsh.git
+   git clone https://github.com/Miguezpz/media-sorter-zsh.git
    cd media-sorter-zsh
    ```
 
@@ -61,4 +61,3 @@ You can run the script in non-interactive mode by providing arguments:
 
 ## License
 MIT
-# media-sorter-zsh
