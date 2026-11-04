@@ -335,10 +335,15 @@ organize_files() {
     print_info "Archivos encontrados: $STAT_TOTAL"
     (( STAT_TOTAL == 0 )) && return 0
 
+    # Mover dentro del mismo disco = rename instantáneo, sin espacio adicional.
+    MOVE_SAME_FS=false
+    if [[ "$COPY_MODE" == "move" ]] && same_filesystem "$SOURCE_DIR" "$DEST_ROOT"; then
+        MOVE_SAME_FS=true
+    fi
+
     # Espacio necesario: solo lo que realmente se va a copiar.
-    # Mover dentro del mismo disco no ocupa espacio adicional.
     local -i needed=0
-    if ! [[ "$COPY_MODE" == "move" ]] || ! same_filesystem "$SOURCE_DIR" "$DEST_ROOT"; then
+    if [[ "$MOVE_SAME_FS" != "true" ]]; then
         local -a st
         for file in "${all_files[@]}"; do
             is_duplicate_to_remove "$file" && continue
@@ -365,14 +370,31 @@ organize_files() {
 
     cleanup_temp_files "$DEST_ROOT" "$LOG_FILE"
 
+    # Leer las fechas de todas las fotos/videos con una sola ejecución de exiftool
+    if [[ "$RENAME_ENABLED" == "true" ]]; then
+        local -a media_files=()
+        local media_cat=""
+        for file in "${all_files[@]}"; do
+            is_duplicate_to_remove "$file" && continue
+            categorize_file "$file" media_cat
+            is_media_category "$media_cat" && media_files+=("$file")
+        done
+        if (( ${#media_files[@]} > 0 )); then
+            print_info "Leyendo fechas de ${#media_files[@]} fotos y videos..."
+            preload_media_dates "${media_files[@]}"
+        fi
+    fi
+
     local category="" rel_path="" rel_dir="" dest_dir="" new_name="" dest_path="" orig_name="" action=""
     local -i idx=0 result=0
     action="COPY"; [[ "$COPY_MODE" == "move" ]] && action="MOVE"
+    # Redibujar la barra ~500 veces como máximo, no una vez por archivo
+    local -i progress_step=$(( STAT_TOTAL / 500 > 0 ? STAT_TOTAL / 500 : 1 ))
 
     init_progress
     for (( idx=1; idx<=STAT_TOTAL; idx++ )); do
         file="${all_files[idx]}"
-        show_progress "$idx" "$STAT_TOTAL"
+        (( idx % progress_step == 0 || idx == STAT_TOTAL )) && show_progress "$idx" "$STAT_TOTAL"
 
         if is_duplicate_to_remove "$file"; then
             (( ++STAT_SKIPPED_DUP ))
@@ -401,11 +423,11 @@ organize_files() {
 
         orig_name="${file:t}"
         if [[ "$RENAME_ENABLED" == "true" ]] && is_media_category "$category"; then
-            new_name=$(determine_filename "$file" "$dest_dir")
+            determine_filename "$file" "$dest_dir"
         else
-            new_name=$(generate_unique_name "$dest_dir" "$orig_name" "$file")
+            generate_unique_name "$dest_dir" "$orig_name" "$file"
         fi
-        [[ -z "$new_name" ]] && new_name="$orig_name"
+        new_name="${REPLY:-$orig_name}"
         dest_path="$dest_dir/$new_name"
 
         # generate_unique_name solo devuelve un nombre existente si el contenido es idéntico

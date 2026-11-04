@@ -54,6 +54,30 @@ check_eq "ruta arrastrada con '\\ ' y espacio final" "/Volumes/STORAGE X" \
 check_eq "ruta entre comillas" "/Volumes/STORAGE X" \
     "$(normalize_path_input "'/Volumes/STORAGE X'")"
 
+LIBT="$TEST_ROOT/libtest"; mkdir -p "$LIBT/a" "$LIBT/b"
+cp "$SRC/iPhone_8_Backup/DCIM/100APPLE/IMG_0002.JPG" "$LIBT/a/  espacio inicial.jpg"
+cp "$SRC/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG" "$LIBT/a/Ñandú café.JPG"
+preload_media_dates "$LIBT/a/  espacio inicial.jpg" "$LIBT/a/Ñandú café.JPG"
+determine_filename "$LIBT/a/  espacio inicial.jpg" "$LIBT/b"
+check_eq "fecha EXIF con espacios al inicio del nombre" "20231101_091530.jpg" "$REPLY"
+determine_filename "$LIBT/a/Ñandú café.JPG" "$LIBT/b"
+check_eq "fecha EXIF con acentos en el nombre" "20231025_143005.jpg" "$REPLY"
+
+DRY_RUN=false; DEST_ROOT="$LIBT/b"
+echo uno > "$LIBT/a/m1.txt"; echo dos > "$LIBT/a/m2.txt"
+MOVE_SAME_FS=true;  move_file "$LIBT/a/m1.txt" "$LIBT/b/m1.txt" ""
+check "mover en el mismo disco (rename)"        '[[ -f "$LIBT/b/m1.txt" && ! -e "$LIBT/a/m1.txt" ]]'
+MOVE_SAME_FS=false; move_file "$LIBT/a/m2.txt" "$LIBT/b/m2.txt" ""
+check "mover entre discos (copia verificada)"   '[[ "$(<$LIBT/b/m2.txt)" == dos && ! -e "$LIBT/a/m2.txt" ]]'
+echo otro > "$LIBT/a/m3.txt"; MOVE_SAME_FS=true
+check "mover no sobrescribe un archivo existente" '! move_file "$LIBT/a/m3.txt" "$LIBT/b/m1.txt" "" && [[ "$(<$LIBT/b/m1.txt)" == uno ]]'
+
+generate_unique_name "$LIBT/b" "m1.txt" "$LIBT/a/m3.txt"
+check_eq "colisión con contenido distinto → sufijo _1" "m1_1.txt" "$REPLY"
+cp "$LIBT/b/m1.txt" "$LIBT/a/m1_igual.txt"
+generate_unique_name "$LIBT/b" "m1.txt" "$LIBT/a/m1_igual.txt"
+check_eq "colisión con contenido idéntico → mismo nombre" "m1.txt" "$REPLY"
+
 DEST_ROOT=""
 scan_duplicates "$SRC" "$TEST_ROOT/dupes.json" 2>/dev/null
 parse_jdupes_output "$TEST_ROOT/dupes.json"

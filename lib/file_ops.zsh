@@ -4,6 +4,11 @@
 # ============================================================================
 
 zmodload -F zsh/stat b:zstat 2>/dev/null
+zmodload -F zsh/datetime b:strftime p:EPOCHSECONDS 2>/dev/null
+
+# true cuando origen y destino están en el mismo sistema de archivos y se
+# está moviendo: entonces basta un rename (mv), instantáneo y sin espacio extra.
+typeset -g MOVE_SAME_FS=false
 
 typeset -gA CATEGORIES
 CATEGORIES=(
@@ -60,12 +65,6 @@ is_media_category() {
     [[ "$1" == "Imagenes" || "$1" == "Videos" ]]
 }
 
-# Ruta del temporal para una copia atómica: oculto y junto al destino.
-tmp_path_for() {
-    local dest="$1"
-    echo "${dest:h}/.${dest:t}${TMP_SUFFIX}"
-}
-
 copy_file() {
     local src="$1"
     local dest="$2"
@@ -78,15 +77,13 @@ copy_file() {
         return 0
     fi
 
-    local tmp_dest=$(tmp_path_for "$dest")
+    local tmp_dest="${dest:h}/.${dest:t}${TMP_SUFFIX}"
     if ! cp -p "$src" "$tmp_dest" 2>/dev/null; then
         log_operation "$log_file" "ERROR" "$src" "$dest" "Copy failed: $details"
         rm -f "$tmp_dest" 2>/dev/null || true
         return 1
     fi
-    local src_size=$(get_file_size "$src")
-    local tmp_size=$(get_file_size "$tmp_dest")
-    if [[ "$src_size" != "$tmp_size" ]]; then
+    if ! same_size "$src" "$tmp_dest"; then
         log_operation "$log_file" "ERROR" "$src" "$dest" "Size mismatch after copy"
         rm -f "$tmp_dest" 2>/dev/null || true
         return 1
@@ -112,15 +109,24 @@ move_file() {
         return 0
     fi
 
-    local tmp_dest=$(tmp_path_for "$dest")
+    # Mismo disco: rename atómico, sin copiar datos.
+    if [[ "$MOVE_SAME_FS" == "true" ]]; then
+        if [[ -e "$dest" ]] || ! mv -n "$src" "$dest" 2>/dev/null || [[ -e "$src" || ! -f "$dest" ]]; then
+            log_operation "$log_file" "ERROR" "$src" "$dest" "Rename failed: $details"
+            return 1
+        fi
+        log_operation "$log_file" "$action" "$src" "$dest" "$details"
+        return 0
+    fi
+
+    # Otro disco: copiar a temporal, verificar tamaño y hash, y luego borrar el origen.
+    local tmp_dest="${dest:h}/.${dest:t}${TMP_SUFFIX}"
     if ! cp -p "$src" "$tmp_dest" 2>/dev/null; then
         log_operation "$log_file" "ERROR" "$src" "$dest" "Move phase failed: $details"
         rm -f "$tmp_dest" 2>/dev/null || true
         return 1
     fi
-    local src_size=$(get_file_size "$src")
-    local tmp_size=$(get_file_size "$tmp_dest")
-    if [[ "$src_size" != "$tmp_size" ]]; then
+    if ! same_size "$src" "$tmp_dest"; then
         log_operation "$log_file" "ERROR" "$src" "$dest" "Size mismatch after copy"
         rm -f "$tmp_dest" 2>/dev/null || true
         return 1
@@ -171,7 +177,8 @@ log_operation() {
     local dest="$4"
     local details="$5"
     [[ -z "$log_file" ]] && return 0
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    strftime -s timestamp '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS
 
     local rel_dest="$dest"
     if [[ -n "${DEST_ROOT:-}" && "$dest" == "$DEST_ROOT"/* ]]; then
@@ -281,8 +288,8 @@ nearest_existing_dir() {
 }
 
 get_free_space_bytes() {
-    local path=$(nearest_existing_dir "$1")
-    /bin/df -k "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {printf "%.0f", $4 * 1024}'
+    local dir=$(nearest_existing_dir "$1")
+    /bin/df -k "$dir" 2>/dev/null | /usr/bin/awk 'NR==2 {printf "%.0f", $4 * 1024}'
 }
 
 # ¿Están ambas rutas en el mismo sistema de archivos?
@@ -328,14 +335,23 @@ get_file_size() {
     fi
 }
 
+# ¿Tienen ambos archivos el mismo tamaño? (sin crear subprocesos)
+same_size() {
+    local -a sa sb
+    zstat -A sa +size -- "$1" 2>/dev/null || return 1
+    zstat -A sb +size -- "$2" 2>/dev/null || return 1
+    [[ "${sa[1]}" == "${sb[1]}" ]]
+}
+
 get_file_hash() {
     local filepath="$1"
     md5 -q "$filepath" 2>/dev/null || echo ""
 }
 
-# Devuelve un nombre libre en dest_dir. Si ya existe un archivo con el mismo
-# nombre Y el mismo contenido que src_file, devuelve ese nombre (el llamador
-# lo detecta con -f y lo omite). El hash solo se calcula cuando hay colisión.
+# Deja en REPLY un nombre libre en dest_dir. Si ya existe un archivo con el
+# mismo nombre Y el mismo contenido que src_file, deja ese nombre (el llamador
+# lo detecta con -f y lo omite). El hash solo se calcula si hay colisión de
+# nombre y además los tamaños coinciden.
 generate_unique_name() {
     local dest_dir="$1"
     local filename="$2"
@@ -355,11 +371,11 @@ generate_unique_name() {
     local src_hash="" dest_hash
 
     while [[ -e "$dest_dir/$candidate" ]]; do
-        if [[ -n "$src_file" && -f "$dest_dir/$candidate" ]]; then
+        if [[ -n "$src_file" && -f "$dest_dir/$candidate" ]] && same_size "$src_file" "$dest_dir/$candidate"; then
             [[ -z "$src_hash" ]] && src_hash=$(get_file_hash "$src_file")
             dest_hash=$(get_file_hash "$dest_dir/$candidate")
             if [[ -n "$src_hash" && "$src_hash" == "$dest_hash" ]]; then
-                echo "$candidate"
+                REPLY="$candidate"
                 return 0
             fi
         fi
@@ -367,5 +383,5 @@ generate_unique_name() {
         (( ++counter ))
     done
 
-    echo "$candidate"
+    REPLY="$candidate"
 }
