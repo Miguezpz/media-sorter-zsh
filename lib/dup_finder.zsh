@@ -14,6 +14,7 @@ typeset -ga KEEP_FILES=()
 typeset -ga REMOVE_FILES=()
 typeset -gA REMOVE_SET=()
 typeset -gi DUP_WASTED_BYTES=0
+typeset -ga PROTECTED_DIRS   # definido en protect.zsh
 
 # Separa un grupo en el array global `reply`: (tamaño archivo1 archivo2 ...)
 split_group() {
@@ -29,10 +30,18 @@ scan_duplicates() {
     # -r recursivo, -j salida JSON, -q sin barra de progreso, -H incluir hardlinks
     local -a cmd=(jdupes -r -j -q -H)
 
-    # Excluir basura del sistema y salidas previas (filtro "nostr" = la ruta
-    # contiene el texto). Así jdupes ni siquiera calcula hashes de esos archivos.
+    # Mismas exclusiones que scan_files (filtro "nostr" = la ruta contiene el
+    # texto), así jdupes ni siquiera calcula hashes de esos archivos:
+    # todo lo oculto ("/."), carpetas de sistema, datos de apps Android,
+    # carpetas protegidas (programas/juegos/proyectos) y el destino.
+    if [[ "$source_dir" != */.* ]]; then
+        cmd+=(-X "nostr:/.")
+    else
+        cmd+=(-X "nostr:/._" -X "nostr:/.DS_Store" -X "nostr:/.thumbnails/" -X "nostr:${TMP_SUFFIX}")
+    fi
     for item in "${SYSTEM_DIRS[@]}"; do cmd+=(-X "nostr:/$item/"); done
-    cmd+=(-X "nostr:/._" -X "nostr:/.DS_Store" -X "nostr:/Thumbs.db" -X "nostr:/desktop.ini" -X "nostr:${TMP_SUFFIX}")
+    cmd+=(-X "nostr:/Android/data/" -X "nostr:/Android/obb/" -X "nostr:/Thumbs.db" -X "nostr:/desktop.ini")
+    for item in "${PROTECTED_DIRS[@]}"; do cmd+=(-X "nostr:$item/"); done
     if [[ -n "${DEST_ROOT:-}" && "$DEST_ROOT" == "$source_dir"/* ]]; then
         cmd+=(-X "nostr:$DEST_ROOT/")
     fi

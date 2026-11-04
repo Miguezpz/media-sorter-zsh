@@ -18,46 +18,66 @@ CATEGORIES=(
     Documentos  "pdf doc docx txt xls xlsx ppt pptx md rtf odt ods odp pages numbers key csv"
 )
 
-# Carpetas de sistema que nunca deben procesarse (macOS, Windows y la propia salida).
-typeset -ga SYSTEM_DIRS=(
-    .Trashes .Spotlight-V100 .fseventsd .TemporaryItems .DocumentRevisions-V100
-    .PKInstallSandboxManager .PKInstallSandboxManager-SystemSoftware
-    '$RECYCLE.BIN' 'System Volume Information' _Organized
-)
+# Extensión -> categoría (se construye una vez a partir de CATEGORIES)
+typeset -gA EXT_CATEGORY=()
+() {
+    local c e
+    for c in "${(@k)CATEGORIES}"; do
+        for e in ${=CATEGORIES[$c]}; do EXT_CATEGORY[$e]="$c"; done
+    done
+}
 
-# Archivos basura: metadatos de Finder, AppleDouble (._*) en discos exFAT/FAT,
-# miniaturas de Windows y temporales propios de este programa.
-typeset -ga SYSTEM_FILES=(
-    .DS_Store '._*' .localized Thumbs.db desktop.ini '*.msort-tmp'
-)
+# Qué NO se procesa nunca:
+# - Todo lo oculto (nombre que empieza por "."): .DS_Store, AppleDouble ._*,
+#   .Trashes, .Spotlight-V100, .thumbnails de Android, .Statuses de WhatsApp,
+#   .git, temporales propios (.*.msort-tmp)...
+# - Carpetas de sistema de Windows y salidas previas de este programa.
+# - Datos internos de apps Android (Android/data, Android/obb). OJO:
+#   Android/media SÍ se procesa: ahí guarda WhatsApp las fotos y videos.
+typeset -ga SYSTEM_DIRS=('$RECYCLE.BIN' 'System Volume Information' _Organized)
+typeset -ga SYSTEM_DIR_PATHS=('*/Android/data' '*/Android/obb')
+typeset -ga SYSTEM_FILES=(Thumbs.db desktop.ini)
+
+# Escapa los comodines de una ruta para usarla en "find -path" (rutas con [ ] * ?)
+glob_escape() {
+    setopt localoptions extendedglob
+    REPLY="${1//(#m)[][*?\\]/\\$MATCH}"
+}
+
+# ¿Debe ignorarse esta ruta (relativa al origen) por ser de sistema u oculta?
+is_system_rel_path() {
+    local rel="/$1" comp
+    [[ "$rel" == */.* ]] && return 0
+    [[ "$rel" == */Android/(data|obb)(|/*) ]] && return 0
+    for comp in "${(@s:/:)1}"; do
+        (( ${SYSTEM_DIRS[(Ie)$comp]} )) && return 0
+    done
+    return 1
+}
 
 # Sufijo de los temporales de copia atómica (solo se limpian los nuestros).
 typeset -g TMP_SUFFIX=".msort-tmp"
 
+# Nombres de destino ya asignados durante una simulación (dry run)
+typeset -gA DRY_RESERVED=()
+
+# categorize_file RUTA [VARIABLE]
+# Deja la categoría en REPLY y, si se indica, también en VARIABLE (asignación
+# indirecta, funciona aunque VARIABLE sea local del llamador). Sin VARIABLE,
+# la imprime.
 categorize_file() {
-    local filepath="$1"
-    local out_var="${2:-}"
-    local ext="${filepath:t}"
-    if [[ "$ext" == *.* ]]; then
-        ext="${${ext##*.}:l}"
+    local _cf_ext="${1:t}"
+    if [[ "$_cf_ext" == ?*.* ]]; then
+        _cf_ext="${${_cf_ext##*.}:l}"
+        REPLY="${EXT_CATEGORY[$_cf_ext]:-Otros}"
     else
-        ext=""
-    fi
-    local result="Otros" cat_name
-
-    if [[ -n "$ext" ]]; then
-        for cat_name in "${(@k)CATEGORIES}"; do
-            if [[ " ${CATEGORIES[$cat_name]} " == *" $ext "* ]]; then
-                result="$cat_name"
-                break
-            fi
-        done
+        REPLY="Otros"
     fi
 
-    if [[ -n "$out_var" ]]; then
-        typeset -g "$out_var=$result"
+    if [[ -n "${2:-}" ]]; then
+        : ${(P)2::=$REPLY}
     else
-        echo "$result"
+        echo "$REPLY"
     fi
 }
 
@@ -193,6 +213,9 @@ is_junk_file() {
     [[ "$name" == (.DS_Store|._*|.localized|Thumbs.db|desktop.ini) ]]
 }
 
+# Carpetas protegidas: si lib/protect.zsh no está cargado, ninguna.
+(( ${+functions[is_protected_path]} )) || is_protected_path() { return 1; }
+
 # Elimina carpetas vacías del origen (las que solo contienen .DS_Store y
 # similares también cuentan como vacías). Nunca toca el destino ni el propio origen.
 cleanup_empty_dirs() {
@@ -200,17 +223,15 @@ cleanup_empty_dirs() {
     local log_file="$2"
     local count=0 dir entry
     local -a entries real junk
-    local comp skip_dir
 
     print_info "Limpiando carpetas vacías en el origen..."
     # Nota: -prune no funciona junto con -depth, por eso se filtra en el bucle.
     while IFS= read -r -d '' dir; do
         [[ -n "${DEST_ROOT:-}" && ( "$dir" == "$DEST_ROOT" || "$dir" == "$DEST_ROOT"/* ) ]] && continue
-        skip_dir=false
-        for comp in "${(@s:/:)${dir#$source_dir/}}"; do
-            if (( ${SYSTEM_DIRS[(Ie)$comp]} )); then skip_dir=true; break; fi
-        done
-        [[ "$skip_dir" == "true" ]] && continue
+        # Nunca tocar carpetas de sistema/ocultas ni nada dentro de una protegida
+        is_system_rel_path "${dir#$source_dir/}" && continue
+        (( ${+PROT_SET[$dir]} )) && continue
+        is_protected_path "$dir/x" && continue
 
         entries=("$dir"/*(DN))
         real=() junk=()
@@ -237,23 +258,26 @@ cleanup_empty_dirs() {
     print_success "Carpetas vacías eliminadas: $count"
 }
 
-# Lista (separada por NUL) los archivos a organizar, excluyendo basura del
-# sistema, carpetas _Organized previas y el destino si está dentro del origen.
+# Lista (separada por NUL) los archivos a organizar, excluyendo lo oculto, lo
+# de sistema, salidas _Organized previas y el destino si está dentro del origen.
+# Además emite las carpetas ".git" (sin recorrerlas) para detectar proyectos.
 scan_files() {
     local source_dir="$1"
-    local -a prune=() skip=()
+    local -a prune=(-name '.*') skip=(-not -name '.*')
     local item
 
-    for item in "${SYSTEM_DIRS[@]}"; do prune+=(-name "$item" -o); done
+    for item in "${SYSTEM_DIRS[@]}"; do prune+=(-o -name "$item"); done
+    for item in "${SYSTEM_DIR_PATHS[@]}"; do prune+=(-o -path "$item"); done
     if [[ -n "${DEST_ROOT:-}" && "$DEST_ROOT" == "$source_dir"/* ]]; then
-        prune+=(-path "$DEST_ROOT" -o)
+        glob_escape "$DEST_ROOT"
+        prune+=(-o -path "$REPLY")
     fi
-    prune[-1]=()   # quitar el último -o
-
     for item in "${SYSTEM_FILES[@]}"; do skip+=(-not -name "$item"); done
 
-    find "$source_dir" -mindepth 1 \( -type d \( "${prune[@]}" \) -prune \) -o \
-        -type f "${skip[@]}" -print0 2>/dev/null
+    find "$source_dir" -mindepth 1 \
+        \( -type d -name .git -print0 -prune \) -o \
+        \( -type d \( "${prune[@]}" \) -prune \) -o \
+        \( -type f "${skip[@]}" -print0 \) 2>/dev/null
 }
 
 detect_external_volumes() {
@@ -370,7 +394,9 @@ generate_unique_name() {
     local counter=1
     local src_hash="" dest_hash
 
-    while [[ -e "$dest_dir/$candidate" ]]; do
+    # En simulación no se crea nada, así que se recuerdan los nombres ya
+    # asignados para mostrar colisiones reales (DRY_RESERVED).
+    while [[ -e "$dest_dir/$candidate" ]] || (( ${+DRY_RESERVED[$dest_dir/$candidate]} )); do
         if [[ -n "$src_file" && -f "$dest_dir/$candidate" ]] && same_size "$src_file" "$dest_dir/$candidate"; then
             [[ -z "$src_hash" ]] && src_hash=$(get_file_hash "$src_file")
             dest_hash=$(get_file_hash "$dest_dir/$candidate")

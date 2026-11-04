@@ -54,6 +54,46 @@ echo "nombre raro"      > "$S/Rara [1] \$dir/Informe (final) *v2*.docx"
 echo "fake unknown" > "$S/OldBackup/random.xyz"
 echo "user tmp"     > "$S/OldBackup/session.tmp"
 
+# --- Casos reales vistos en discos de respaldo de teléfonos -----------------
+# Fecha en el nombre (sin EXIF): WhatsApp en Android/media, video Samsung, Facebook
+W="$S/Mama_OPPO/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images"
+mkdir -p "$W" "$S/Mama_OPPO/DCIM/Camera" "$S/Mama_OPPO/DCIM/.thumbnails" \
+         "$S/Mama_OPPO/Android/data/com.app/cache" "$S/Facebook"
+echo "whatsapp foto"   > "$W/IMG-20210513-WA0059.jpg"
+echo "video samsung"   > "$S/Mama_OPPO/DCIM/Camera/20231208_233423.mp4"
+echo "facebook"        > "$S/Facebook/FB_IMG_15401296052513054.jpg"
+# Basura de apps Android: miniaturas y datos internos (no deben procesarse)
+echo "miniatura"       > "$S/Mama_OPPO/DCIM/.thumbnails/1000171187.jpg"
+echo "cache app"       > "$S/Mama_OPPO/Android/data/com.app/cache/img.jpg"
+
+# Google Takeout: foto sin fecha en nombre ni EXIF + su JSON con la fecha real
+T="$S/google photos backup/Takeout/Google Photos/Photos from 2015"
+mkdir -p "$T"
+print -r -- "$TINY_JPEG" | base64 -d > "$T/foto_playa.jpg"
+echo '{"title":"foto_playa.jpg","photoTakenTime":{"timestamp":"1421183519","formatted":"13 ene 2015"}}' \
+    > "$T/foto_playa.jpg.supplemental-metadata.json"
+
+# Juego/programa: debe quedar intacto (tiene .dll)
+mkdir -p "$S/Juegos/MiJuego/data"
+echo "exe"     > "$S/Juegos/MiJuego/game.exe"
+echo "dll"     > "$S/Juegos/MiJuego/engine.dll"
+echo "img"     > "$S/Juegos/MiJuego/data/textures.img"
+echo "preview" > "$S/Juegos/MiJuego/preview.png"
+
+# Proyectos de código: deben quedar intactos
+mkdir -p "$S/Code/app/node_modules/lib" "$S/Code2/repo/.git"
+echo '{}'      > "$S/Code/app/package.json"
+echo 'js'      > "$S/Code/app/index.js"
+echo 'lib'     > "$S/Code/app/node_modules/lib/index.js"
+echo 'logo'    > "$S/Code/app/logo.png"
+echo 'ref'     > "$S/Code2/repo/.git/HEAD"
+echo 'print()' > "$S/Code2/repo/main.py"
+
+# Un .exe suelto junto a documentos personales NO protege la carpeta
+mkdir -p "$S/USB MAMA"
+echo "instalador" > "$S/USB MAMA/instalador.exe"
+echo "carta"      > "$S/USB MAMA/carta.docx"
+
 # Basura de sistema que NO debe procesarse
 echo "x" > "$S/._IMG_0001.JPG"
 echo "x" > "$S/.DS_Store"

@@ -17,6 +17,7 @@ source "$LIB_DIR/ui_helpers.zsh"
 source "$LIB_DIR/file_ops.zsh"
 source "$LIB_DIR/dup_finder.zsh"
 source "$LIB_DIR/exif_rename.zsh"
+source "$LIB_DIR/protect.zsh"
 
 # Global configuration
 typeset -g SOURCE_DIR=""
@@ -25,6 +26,8 @@ typeset -g BACKUP_ID=""
 typeset -g MODE="full"          # full, duplicates, organize
 typeset -g COPY_MODE="copy"     # copy, move
 typeset -g RENAME_ENABLED=true
+typeset -g LAYOUT="fecha"       # fecha (Año/Año-Mes) | original (rutas originales)
+typeset -g PROTECT_ENABLED=true # no tocar programas, juegos ni proyectos de código
 typeset -g CLEANUP_ENABLED=true # solo aplica en modo move
 typeset -g DRY_RUN=false
 typeset -g INTERACTIVE=true
@@ -39,6 +42,12 @@ typeset -gi STAT_SKIPPED_DUP=0
 typeset -gi STAT_SKIPPED_EXIST=0
 typeset -gi STAT_RENAMED=0
 typeset -gi STAT_ERRORS=0
+typeset -gi STAT_NO_DATE=0
+typeset -gi STAT_PROTECTED=0
+typeset -gi STAT_SIDECARS=0
+
+# Archivos a procesar (lo llena analyze_source)
+typeset -ga ALL_FILES=()
 typeset -g  ABORT_REASON=""
 
 die() {
@@ -58,7 +67,9 @@ Opciones:
   --backup-id NOMBRE    Subcarpeta de lote dentro de cada categoría (opcional)
   --mode MODO           full | duplicates | organize   (por defecto: full)
   --copy | --move       Copiar (por defecto) o mover los archivos
-  --rename | --no-rename    Renombrar fotos/videos por fecha de captura (por defecto: sí)
+  --layout fecha|original   Fotos y videos en Año/Año-Mes (por defecto) o en sus rutas originales
+  --rename | --no-rename    Renombrar por fecha las fotos/videos cuyo nombre no la trae (por defecto: sí)
+  --no-protect          No proteger carpetas de programas, juegos y proyectos de código
   --cleanup | --no-cleanup  Borrar carpetas vacías del origen tras mover (por defecto: sí)
   --dry-run             Simular sin modificar nada
   --no-interactive      No hacer preguntas (los duplicados se resuelven automáticamente)
@@ -152,7 +163,16 @@ get_user_config() {
     # 5. Opciones
     if [[ "$MODE" != "duplicates" ]]; then
         print_section "OPCIONES"
-        if confirm "¿Renombrar fotos y videos por fecha de captura (YYYYMMDD_HHMMSS)?" "Y"; then
+        local -a layout_options=(
+            "Por fecha: Imagenes/2023/2023-11/ (recomendado)"
+            "Mantener las carpetas originales: Imagenes/samsung/DCIM/..."
+        )
+        case $(select_menu "¿Cómo ordenar fotos y videos?" "${layout_options[@]}") in
+            1) LAYOUT="fecha" ;;
+            2) LAYOUT="original" ;;
+        esac
+
+        if confirm "¿Renombrar con su fecha (YYYYMMDD_HHMMSS) las fotos/videos cuyo nombre no la incluye?" "Y"; then
             RENAME_ENABLED=true
         else
             RENAME_ENABLED=false
@@ -199,7 +219,9 @@ print_config_summary() {
     printf "  ${COLORS[BOLD]}Modo:${COLORS[RESET]}            %s\n" "$MODE" >&2
     if [[ "$MODE" != "duplicates" ]]; then
         printf "  ${COLORS[BOLD]}Copiar/Mover:${COLORS[RESET]}    %s\n" "$COPY_MODE" >&2
-        printf "  ${COLORS[BOLD]}Renombrar:${COLORS[RESET]}       %s\n" "$([[ $RENAME_ENABLED == true ]] && echo 'sí (solo fotos/videos)' || echo no)" >&2
+        printf "  ${COLORS[BOLD]}Fotos/videos:${COLORS[RESET]}    %s\n" "$([[ $LAYOUT == fecha ]] && echo 'por fecha (Año/Año-Mes)' || echo 'carpetas originales')" >&2
+        printf "  ${COLORS[BOLD]}Renombrar:${COLORS[RESET]}       %s\n" "$([[ $RENAME_ENABLED == true ]] && echo 'sí (solo fotos/videos sin fecha en el nombre)' || echo no)" >&2
+        printf "  ${COLORS[BOLD]}Proteger:${COLORS[RESET]}        %s\n" "$([[ $PROTECT_ENABLED == true ]] && echo 'programas, juegos y proyectos (no se tocan)' || echo no)" >&2
     fi
     [[ "$DRY_RUN" == "true" ]] && printf "  ${COLORS[BOLD]}Simulación:${COLORS[RESET]}      sí\n" >&2
     return 0
@@ -208,13 +230,14 @@ print_config_summary() {
 parse_args() {
     while (( $# > 0 )); do
         case "$1" in
-            --source|--dest|--backup-id|--mode)
+            --source|--dest|--backup-id|--mode|--layout)
                 [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "Falta el valor para $1"
                 case "$1" in
                     --source)    SOURCE_DIR="$2" ;;
                     --dest)      DEST_ROOT="$2" ;;
                     --backup-id) BACKUP_ID="$2" ;;
                     --mode)      MODE="$2" ;;
+                    --layout)    LAYOUT="$2" ;;
                 esac
                 shift 2 ;;
             --dry-run)        DRY_RUN=true; shift ;;
@@ -224,6 +247,8 @@ parse_args() {
             --no-rename)      RENAME_ENABLED=false; shift ;;
             --cleanup)        CLEANUP_ENABLED=true; shift ;;
             --no-cleanup)     CLEANUP_ENABLED=false; shift ;;
+            --protect)        PROTECT_ENABLED=true; shift ;;
+            --no-protect)     PROTECT_ENABLED=false; shift ;;
             --no-interactive) INTERACTIVE=false; shift ;;
             -h|--help)        usage; exit 0 ;;
             *)
@@ -248,6 +273,11 @@ validate_config() {
     case "$MODE" in
         full|duplicates|organize) ;;
         *) die "Modo inválido: '$MODE' (usa full, duplicates u organize)" ;;
+    esac
+
+    case "$LAYOUT" in
+        fecha|original) ;;
+        *) die "Organización inválida: '$LAYOUT' (usa fecha u original)" ;;
     esac
 
     BACKUP_ID="${BACKUP_ID// /_}"
@@ -288,6 +318,50 @@ validate_config() {
 # Pipeline
 # ============================================================================
 
+# Escanea el origen, detecta carpetas protegidas y deja en ALL_FILES lo que
+# hay que organizar.
+analyze_source() {
+    print_section "ANALIZANDO EL ORIGEN"
+    print_info "Escaneando archivos (se ignoran ocultos, .thumbnails, Android/data y Android/obb)..."
+
+    local -a found=()
+    local file
+    while IFS= read -r -d '' file; do
+        found+=("$file")
+    done < <(scan_files "$SOURCE_DIR")
+
+    if [[ "$PROTECT_ENABLED" == "true" ]]; then
+        compute_protected_dirs "$SOURCE_DIR" "${found[@]}"
+    else
+        PROT_SET=() PROTECTED_DIRS=()
+    fi
+
+    ALL_FILES=()
+    for file in "${found[@]}"; do
+        [[ "${file:t}" == ".git" ]] && continue
+        if is_protected_path "$file"; then
+            (( ++STAT_PROTECTED ))
+            continue
+        fi
+        ALL_FILES+=("$file")
+    done
+    STAT_TOTAL=${#ALL_FILES[@]}
+    print_info "Archivos a procesar: $STAT_TOTAL"
+
+    if (( ${#PROTECTED_DIRS[@]} > 0 )); then
+        print_warn "Carpetas protegidas (no se tocan, $STAT_PROTECTED archivos):"
+        local d
+        local -i shown=0
+        for d in "${PROTECTED_DIRS[@]}"; do
+            (( ++shown > 15 )) && { print_info "  ... y $(( ${#PROTECTED_DIRS[@]} - 15 )) más (ver log)"; break; }
+            printf "    ${COLORS[DIM]}%-26s${COLORS[RESET]} %s\n" "${PROT_SET[$d]}" "${d#$SOURCE_DIR/}" >&2
+        done
+        for d in "${PROTECTED_DIRS[@]}"; do
+            log_operation "$LOG_FILE" "PROTECT" "$d" "" "${PROT_SET[$d]}"
+        done
+    fi
+}
+
 run_duplicate_scan() {
     [[ "$MODE" == "organize" ]] && return 0
     print_section "BUSCANDO DUPLICADOS"
@@ -324,16 +398,9 @@ organize_files() {
     [[ "$MODE" == "duplicates" ]] && return 0
     print_section "ORGANIZANDO ARCHIVOS"
 
-    local -a all_files=()
+    local -a all_files=("${ALL_FILES[@]}")
     local file
-    print_info "Escaneando el origen..."
-    while IFS= read -r -d '' file; do
-        all_files+=("$file")
-    done < <(scan_files "$SOURCE_DIR")
-
-    STAT_TOTAL=${#all_files[@]}
-    print_info "Archivos encontrados: $STAT_TOTAL"
-    (( STAT_TOTAL == 0 )) && return 0
+    (( STAT_TOTAL == 0 )) && { print_info "No hay archivos que organizar."; return 0; }
 
     # Mover dentro del mismo disco = rename instantáneo, sin espacio adicional.
     MOVE_SAME_FS=false
@@ -370,23 +437,27 @@ organize_files() {
 
     cleanup_temp_files "$DEST_ROOT" "$LOG_FILE"
 
-    # Leer las fechas de todas las fotos/videos con una sola ejecución de exiftool
-    if [[ "$RENAME_ENABLED" == "true" ]]; then
-        local -a media_files=()
+    # Fechas de fotos/videos: las que no vienen en el nombre se leen de los
+    # metadatos con una sola ejecución de exiftool.
+    local -i use_dates=0
+    [[ "$RENAME_ENABLED" == "true" || "$LAYOUT" == "fecha" ]] && use_dates=1
+    if (( use_dates )); then
+        local -a need_exif=()
         local media_cat=""
         for file in "${all_files[@]}"; do
             is_duplicate_to_remove "$file" && continue
             categorize_file "$file" media_cat
-            is_media_category "$media_cat" && media_files+=("$file")
+            is_media_category "$media_cat" || continue
+            date_from_filename "$file" || need_exif+=("$file")
         done
-        if (( ${#media_files[@]} > 0 )); then
-            print_info "Leyendo fechas de ${#media_files[@]} fotos y videos..."
-            preload_media_dates "${media_files[@]}"
+        if (( ${#need_exif[@]} > 0 )); then
+            print_info "Leyendo metadatos de ${#need_exif[@]} fotos/videos sin fecha en el nombre..."
+            preload_media_dates "${need_exif[@]}"
         fi
     fi
 
-    local category="" rel_path="" rel_dir="" dest_dir="" new_name="" dest_path="" orig_name="" action=""
-    local -i idx=0 result=0
+    local category="" rel_path="" rel_dir="" dest_dir="" new_name="" dest_path="" orig_name="" action="" base_name=""
+    local -i idx=0 result=0 is_media=0 has_date=0
     action="COPY"; [[ "$COPY_MODE" == "move" ]] && action="MOVE"
     # Redibujar la barra ~500 veces como máximo, no una vez por archivo
     local -i progress_step=$(( STAT_TOTAL / 500 > 0 ? STAT_TOTAL / 500 : 1 ))
@@ -402,16 +473,40 @@ organize_files() {
             continue
         fi
 
-        categorize_file "$file" category
+        # Los JSON de Google Takeout son metadatos de otra foto: se quedan donde están
+        if is_takeout_sidecar "$file"; then
+            (( ++STAT_SIDECARS ))
+            continue
+        fi
 
-        # Se conserva la estructura de carpetas original dentro de cada categoría
+        categorize_file "$file" category
+        orig_name="${file:t}"
         rel_path="${file#$SOURCE_DIR/}"
         rel_dir=""
         [[ "$rel_path" == */* ]] && rel_dir="${rel_path%/*}"
 
+        is_media=0
+        has_date=0
+        if is_media_category "$category"; then
+            is_media=1
+            (( use_dates )) && media_date_for "$file" && has_date=1
+        fi
+
         dest_dir="$DEST_ROOT/$category"
         [[ -n "$BACKUP_ID" ]] && dest_dir+="/$BACKUP_ID"
-        [[ -n "$rel_dir" ]] && dest_dir+="/$rel_dir"
+        if (( is_media )) && [[ "$LAYOUT" == "fecha" ]]; then
+            if (( has_date )); then
+                dest_dir+="/${MEDIA_DATE[1,4]}/${MEDIA_DATE[1,4]}-${MEDIA_DATE[5,6]}"
+            else
+                # Sin fecha fiable: se conserva su carpeta de origen para no perder contexto
+                dest_dir+="/Sin_fecha"
+                [[ -n "$rel_dir" ]] && dest_dir+="/$rel_dir"
+            fi
+        else
+            # Audio, documentos y otros conservan su estructura original
+            [[ -n "$rel_dir" ]] && dest_dir+="/$rel_dir"
+        fi
+        (( is_media && ! has_date && use_dates )) && (( ++STAT_NO_DATE ))
 
         if [[ "$DRY_RUN" != "true" && ! -d "$dest_dir" ]]; then
             if ! mkdir -p "$dest_dir" 2>/dev/null; then
@@ -421,14 +516,16 @@ organize_files() {
             fi
         fi
 
-        orig_name="${file:t}"
-        if [[ "$RENAME_ENABLED" == "true" ]] && is_media_category "$category"; then
-            determine_filename "$file" "$dest_dir"
-        else
-            generate_unique_name "$dest_dir" "$orig_name" "$file"
+        # Solo se renombra si la fecha vino de los metadatos (EXIF o Takeout);
+        # si el nombre ya trae la fecha, se conserva tal cual.
+        base_name="$orig_name"
+        if [[ "$RENAME_ENABLED" == "true" ]] && (( has_date )) && [[ "$MEDIA_DATE_SRC" != "nombre" && "$orig_name" == ?*.* ]]; then
+            base_name="${MEDIA_DATE}.${${orig_name##*.}:l}"
         fi
-        new_name="${REPLY:-$orig_name}"
+        generate_unique_name "$dest_dir" "$base_name" "$file"
+        new_name="${REPLY:-$base_name}"
         dest_path="$dest_dir/$new_name"
+        [[ "$DRY_RUN" == "true" ]] && DRY_RESERVED[$dest_path]=1
 
         # generate_unique_name solo devuelve un nombre existente si el contenido es idéntico
         if [[ -f "$dest_path" ]]; then
@@ -446,7 +543,7 @@ organize_files() {
 
         if (( result == 0 )); then
             (( ++STAT_COPIED ))
-            [[ "$new_name" != "$orig_name" ]] && (( ++STAT_RENAMED ))
+            [[ "$base_name" != "$orig_name" ]] && (( ++STAT_RENAMED ))   # solo renombrados por fecha, no sufijos _1
         else
             (( ++STAT_ERRORS ))
         fi
@@ -479,6 +576,9 @@ show_final_report() {
         printf "  ${COLORS[YELLOW]}%-28s${COLORS[RESET]} %d\n" "Duplicados omitidos:" "$STAT_SKIPPED_DUP" >&2
         printf "  ${COLORS[BLUE]}%-28s${COLORS[RESET]} %d\n" "Ya existían en destino:" "$STAT_SKIPPED_EXIST" >&2
         printf "  ${COLORS[MAGENTA]}%-28s${COLORS[RESET]} %d\n" "Renombrados por fecha:" "$STAT_RENAMED" >&2
+        (( STAT_NO_DATE ))   && printf "  %-28s %d\n" "Fotos/videos sin fecha:" "$STAT_NO_DATE" >&2
+        (( STAT_PROTECTED )) && printf "  %-28s %d (en ${#PROTECTED_DIRS[@]} carpetas)\n" "Protegidos (sin tocar):" "$STAT_PROTECTED" >&2
+        (( STAT_SIDECARS ))  && printf "  %-28s %d\n" "JSON de Takeout (sin mover):" "$STAT_SIDECARS" >&2
         printf "  ${COLORS[RED]}%-28s${COLORS[RESET]} %d\n" "Errores:" "$STAT_ERRORS" >&2
     fi
     printf "\n" >&2
@@ -510,6 +610,7 @@ main() {
     (( $# > 0 )) && print_config_summary
 
     local start_time=$SECONDS
+    analyze_source
     run_duplicate_scan
     organize_files
     run_cleanup

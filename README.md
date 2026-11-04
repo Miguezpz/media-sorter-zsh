@@ -8,9 +8,11 @@ A robust, modular, and extremely fast ZSH script designed to organize large medi
 - **Disk Space Check**: Before copying, it computes the exact size of the files that will be copied (duplicates excluded) and stops with a clear message if the destination lacks space. Moving within the same disk needs no extra space.
 - **In-Place Reorganization**: Use the same directory for Source and Destination and the files are organized into a `_Organized` subfolder, which is always excluded from later scans.
 - **Duplicate Detection**: Powered by `jdupes` for byte-by-byte identification of identical files. One copy per group is kept (it prefers names that don't look like copies, e.g. without "copia"/"copy"/"(1)"), and you can choose manually. Duplicates are never deleted: they are simply not copied/moved. A full report is saved as `duplicados_<fecha>.txt`.
-- **Smart Renaming (photos & videos only)**: Renames images and videos to `YYYYMMDD_HHMMSS` using the capture date from metadata (`exiftool`), falling back to the file modification date. Documents, audio and other files keep their original names.
-- **Categorized Hierarchy**: Files go to `Imagenes/`, `Videos/`, `Audio/`, `Documentos/` and `Otros/` (optionally under a batch subfolder), preserving the original folder structure inside each category.
-- **macOS junk filtering**: `._*` AppleDouble files (common on exFAT/FAT USB drives), `.DS_Store`, `.Trashes`, `.Spotlight-V100`, `.fseventsd`, etc. are ignored.
+- **Reliable capture dates**: The date of each photo/video comes, in this order, from (1) its **file name** (`IMG_20230115_143000`, `IMG-20230115-WA0001`, `20230115_143000`, `Screenshot_2023-01-15-14-30-00`, `FB_IMG_…`), (2) EXIF/QuickTime metadata, (3) the **Google Takeout** `.json` sidecar (`photoTakenTime`). The file modification date is **never** used: on copied backups it is the copy date, not the photo date. Files without a reliable date go to `Sin_fecha/`.
+- **Smart Renaming (photos & videos only)**: Files whose name already contains the date keep their name. The rest are renamed to `YYYYMMDD_HHMMSS` from metadata. Documents, audio and other files always keep their names.
+- **Organized by date**: Photos and videos go to `Imagenes/<Año>/<Año-Mes>/` and `Videos/<Año>/<Año-Mes>/` (or keep their original paths with `--layout original`). Audio, documents and others keep their original folder structure under their category.
+- **Protected folders**: Programs, games, code projects and macOS bundles (`.dll`, `.cab`, `.msi`, `package.json`, `.git`, `node_modules`, `*.app`, `*.photoslibrary`…) are left untouched as a unit instead of being split into categories. A lone `.exe` (e.g. an installer next to personal documents) does not protect a folder.
+- **Junk filtering**: Everything hidden is ignored (`._*` AppleDouble files on exFAT/FAT drives, `.DS_Store`, `.Trashes`, `.Spotlight-V100`, Android `.thumbnails`, WhatsApp `.Statuses`…), as well as Android app data (`Android/data`, `Android/obb`). `Android/media` (where WhatsApp stores photos) **is** processed. Google Takeout `.json` sidecars are left in place.
 - **External Volume Detection & fzf Integration**: Detects connected drives in `/Volumes/` (including read-only NTFS drives). Paths can be typed, dragged into the terminal, or picked with `fzf` (searches `$HOME` and `/Volumes`).
 - **Safety First**: **Dry Run** mode creates nothing in the destination (its log goes to a temp file), copies are atomic with size verification, moves are verified by hash before deleting the source, and every action is logged in `management_log.txt`.
 
@@ -70,7 +72,9 @@ Pass arguments to skip the wizard. Add `--no-interactive` to never prompt (dupli
 | `--mode` | Operation mode: `full`, `duplicates`, or `organize`. |
 | `--copy` / `--move` | `copy` preserves the source. `move` deletes the source after a successful transfer (saves space). |
 | `--dry-run` | Preview actions without making changes. |
-| `--rename` / `--no-rename` | Enable/Disable date-based renaming of photos and videos (default: on). |
+| `--layout fecha\|original` | Photos/videos in `Año/Año-Mes` folders (default) or in their original paths. |
+| `--rename` / `--no-rename` | Rename by date the photos/videos whose name doesn't include it (default: on). |
+| `--no-protect` | Don't protect program, game and code-project folders. |
 | `--cleanup` / `--no-cleanup` | Remove folders left empty in the source after `--move` (default: on). |
 | `--no-interactive` | Never prompt; duplicates are resolved automatically. |
 | `-h`, `--help` | Show usage. |
