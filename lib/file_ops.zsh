@@ -1,79 +1,71 @@
 #!/usr/bin/env zsh
 # ============================================================================
-# File Operations - Categorize, Copy, Cleanup
+# File Operations - Categorize, Copy, Cleanup, Atomic Write
 # ============================================================================
 
-# Category extensions mapping
-# Spanish folder names as per SPECIFICATION.md
+zmodload -F zsh/stat b:zstat 2>/dev/null
+
 typeset -gA CATEGORIES
 CATEGORIES=(
-    Imagenes    "jpg jpeg png gif heic heif webp raw cr2 nef arw dng tiff tif bmp"
-    Videos      "mp4 mov avi mkv m4v 3gp mpg mpeg wmv flv webm"
+    Imagenes    "jpg jpeg png gif heic heif webp raw cr2 cr3 nef arw dng tiff tif bmp"
+    Videos      "mp4 mov avi mkv m4v 3gp mpg mpeg wmv flv webm mts m2ts"
     Audio       "mp3 wav aac flac m4a ogg wma aiff aif"
-    Documentos  "pdf doc docx txt xls xlsx ppt pptx md rtf odt ods odp"
+    Documentos  "pdf doc docx txt xls xlsx ppt pptx md rtf odt ods odp pages numbers key csv"
 )
 
-# Get category for a file extension
+# Carpetas de sistema que nunca deben procesarse (macOS, Windows y la propia salida).
+typeset -ga SYSTEM_DIRS=(
+    .Trashes .Spotlight-V100 .fseventsd .TemporaryItems .DocumentRevisions-V100
+    .PKInstallSandboxManager .PKInstallSandboxManager-SystemSoftware
+    '$RECYCLE.BIN' 'System Volume Information' _Organized
+)
+
+# Archivos basura: metadatos de Finder, AppleDouble (._*) en discos exFAT/FAT,
+# miniaturas de Windows y temporales propios de este programa.
+typeset -ga SYSTEM_FILES=(
+    .DS_Store '._*' .localized Thumbs.db desktop.ini '*.msort-tmp'
+)
+
+# Sufijo de los temporales de copia atómica (solo se limpian los nuestros).
+typeset -g TMP_SUFFIX=".msort-tmp"
+
 categorize_file() {
     local filepath="$1"
-    local ext="${filepath##*.}"
-    ext="${ext:l}"  # lowercase
+    local out_var="${2:-}"
+    local ext="${filepath:t}"
+    if [[ "$ext" == *.* ]]; then
+        ext="${${ext##*.}:l}"
+    else
+        ext=""
+    fi
+    local result="Otros" cat_name
 
-    for category in "${(@k)CATEGORIES}"; do
-        local extensions="${CATEGORIES[$category]}"
-        if [[ " $extensions " == *" $ext "* ]]; then
-            echo "$category"
-            return 0
-        fi
-    done
+    if [[ -n "$ext" ]]; then
+        for cat_name in "${(@k)CATEGORIES}"; do
+            if [[ " ${CATEGORIES[$cat_name]} " == *" $ext "* ]]; then
+                result="$cat_name"
+                break
+            fi
+        done
+    fi
 
-    echo "others"
-    return 0
+    if [[ -n "$out_var" ]]; then
+        typeset -g "$out_var=$result"
+    else
+        echo "$result"
+    fi
 }
 
-# Get category display name (used for display, returns the key since keys are Spanish names)
-get_category_display() {
-    local category="$1"
-    case "$category" in
-        Imagenes)    echo "Imágenes" ;;
-        Videos)      echo "Videos" ;;
-        Audio)       echo "Audio" ;;
-        Documentos)  echo "Documentos" ;;
-        *)           echo "Otros" ;;
-    esac
+is_media_category() {
+    [[ "$1" == "Imagenes" || "$1" == "Videos" ]]
 }
 
-# Ensure destination directory exists
-ensure_dest_dir() {
-    local dest_root="$1"
-    local category="$2"
-    local backup_id="$3"
-
-    local dest_dir="$dest_root/$category/$backup_id"
-    mkdir -p "$dest_dir"
-    echo "$dest_dir"
+# Ruta del temporal para una copia atómica: oculto y junto al destino.
+tmp_path_for() {
+    local dest="$1"
+    echo "${dest:h}/.${dest:t}${TMP_SUFFIX}"
 }
 
-# Generate unique destination filename
-generate_dest_filename() {
-    local dest_dir="$1"
-    local filename="$2"
-    local ext="${filename##*.}"
-    local base="${filename%.*}"
-    local counter=0
-    local new_name="$filename"
-
-    while [[ -e "$dest_dir/$new_name" ]]; do
-        # If same file (same size and hash), we'll handle at caller level
-        # For now, just add counter
-        counter=$((counter + 1))
-        new_name="${base}_${counter}.${ext}"
-    done
-
-    echo "$new_name"
-}
-
-# Copy file with progress logging
 copy_file() {
     local src="$1"
     local dest="$2"
@@ -86,17 +78,28 @@ copy_file() {
         return 0
     fi
 
-    # Copy preserving metadata
-    if cp -p "$src" "$dest" 2>/dev/null; then
-        log_operation "$log_file" "$action" "$src" "$dest" "$details"
-        return 0
-    else
+    local tmp_dest=$(tmp_path_for "$dest")
+    if ! cp -p "$src" "$tmp_dest" 2>/dev/null; then
         log_operation "$log_file" "ERROR" "$src" "$dest" "Copy failed: $details"
+        rm -f "$tmp_dest" 2>/dev/null || true
         return 1
     fi
+    local src_size=$(get_file_size "$src")
+    local tmp_size=$(get_file_size "$tmp_dest")
+    if [[ "$src_size" != "$tmp_size" ]]; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Size mismatch after copy"
+        rm -f "$tmp_dest" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "$tmp_dest" "$dest" 2>/dev/null; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Failed atomic rename"
+        rm -f "$tmp_dest" 2>/dev/null || true
+        return 1
+    fi
+    log_operation "$log_file" "$action" "$src" "$dest" "$details"
+    return 0
 }
 
-# Move file with progress logging
 move_file() {
     local src="$1"
     local dest="$2"
@@ -109,407 +112,260 @@ move_file() {
         return 0
     fi
 
-    # Move (copy + remove source)
-    if cp -p "$src" "$dest" 2>/dev/null && rm -f "$src" 2>/dev/null; then
-        log_operation "$log_file" "$action" "$src" "$dest" "$details"
-        return 0
-    else
-        log_operation "$log_file" "ERROR" "$src" "$dest" "Move failed: $details"
-        # If copy succeeded but remove failed, we may have a duplicate
+    local tmp_dest=$(tmp_path_for "$dest")
+    if ! cp -p "$src" "$tmp_dest" 2>/dev/null; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Move phase failed: $details"
+        rm -f "$tmp_dest" 2>/dev/null || true
         return 1
     fi
+    local src_size=$(get_file_size "$src")
+    local tmp_size=$(get_file_size "$tmp_dest")
+    if [[ "$src_size" != "$tmp_size" ]]; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Size mismatch after copy"
+        rm -f "$tmp_dest" 2>/dev/null || true
+        return 1
+    fi
+    local src_hash=$(get_file_hash "$src")
+    local tmp_hash=$(get_file_hash "$tmp_dest")
+    if [[ -z "$src_hash" || "$src_hash" != "$tmp_hash" ]]; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Hash mismatch after copy"
+        rm -f "$tmp_dest" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "$tmp_dest" "$dest" 2>/dev/null; then
+        log_operation "$log_file" "ERROR" "$src" "$dest" "Failed atomic rename"
+        rm -f "$tmp_dest" 2>/dev/null || true
+        return 1
+    fi
+    if ! rm -f "$src" 2>/dev/null; then
+        log_operation "$log_file" "WARN" "$src" "$dest" "Moved ok but source deletion failed"
+        return 0
+    fi
+    log_operation "$log_file" "$action" "$src" "$dest" "$details"
+    return 0
 }
 
-# Log operation to management log
+# Borra solo los temporales que este programa dejó en una ejecución interrumpida.
+cleanup_temp_files() {
+    local dest_root="$1"
+    local log_file="$2"
+    local count=0 tmp_file
+    [[ "$DRY_RUN" == "true" || ! -d "$dest_root" ]] && return 0
+    while IFS= read -r -d '' tmp_file; do
+        if rm -f "$tmp_file" 2>/dev/null; then
+            log_operation "$log_file" "CLEAN_TMP" "$tmp_file" "" "Removed orphaned temp file"
+            (( ++count ))
+        fi
+    done < <(find "$dest_root" -type f -name "*${TMP_SUFFIX}" -print0 2>/dev/null)
+
+    if [[ $count -gt 0 ]]; then
+        print_info "Limpiados $count archivos temporales de una ejecución anterior."
+    fi
+    return 0
+}
+
 log_operation() {
     local log_file="$1"
     local action="$2"
     local src="$3"
     local dest="$4"
     local details="$5"
-    local timestamp
+    [[ -z "$log_file" ]] && return 0
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-
-    # Make paths relative to dest_root for cleaner logs
     local rel_dest="$dest"
-    if [[ "$dest" == "$DEST_ROOT"* ]]; then
+    if [[ -n "${DEST_ROOT:-}" && "$dest" == "$DEST_ROOT"/* ]]; then
         rel_dest="${dest#$DEST_ROOT/}"
     fi
-
-    printf "%s | %-8s | %s | %s | %s\n" \
-        "$timestamp" "$action" "$src" "$rel_dest" "$details" >> "$log_file"
+    printf "%s | %-8s | %s | %s | %s\n" "$timestamp" "$action" "$src" "$rel_dest" "$details" >> "$log_file" 2>/dev/null || true
 }
 
-# Clean up empty directories in source
+# ¿Es un archivo basura que no impide considerar vacía una carpeta?
+is_junk_file() {
+    local name="${1:t}"
+    [[ "$name" == (.DS_Store|._*|.localized|Thumbs.db|desktop.ini) ]]
+}
+
+# Elimina carpetas vacías del origen (las que solo contienen .DS_Store y
+# similares también cuentan como vacías). Nunca toca el destino ni el propio origen.
 cleanup_empty_dirs() {
     local source_dir="$1"
     local log_file="$2"
-    local count=0
+    local count=0 dir entry
+    local -a entries real junk
+    local comp skip_dir
 
-    print_info "Cleaning empty directories in source..."
+    print_info "Limpiando carpetas vacías en el origen..."
+    # Nota: -prune no funciona junto con -depth, por eso se filtra en el bucle.
+    while IFS= read -r -d '' dir; do
+        [[ -n "${DEST_ROOT:-}" && ( "$dir" == "$DEST_ROOT" || "$dir" == "$DEST_ROOT"/* ) ]] && continue
+        skip_dir=false
+        for comp in "${(@s:/:)${dir#$source_dir/}}"; do
+            if (( ${SYSTEM_DIRS[(Ie)$comp]} )); then skip_dir=true; break; fi
+        done
+        [[ "$skip_dir" == "true" ]] && continue
 
-    # Usando el globbing ZSH recursivo inverso (/Nod = Null glob, Solo directorios, Ordernar por profundidad)
-    # Reemplazo de `find | sort -z` que es incompatible con macOS
-    for dir in "$source_dir"/**/*(/Nod); do
-        if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
-            if [[ "$DRY_RUN" == "true" ]]; then
-                log_operation "$log_file" "CLEANUP" "$dir" "" "(DRY RUN)"
-                ((count++))
+        entries=("$dir"/*(DN))
+        real=() junk=()
+        for entry in "${entries[@]}"; do
+            if [[ -f "$entry" ]] && is_junk_file "$entry"; then
+                junk+=("$entry")
             else
-                if rmdir "$dir" 2>/dev/null; then
-                    log_operation "$log_file" "CLEANUP" "$dir" "" "Removed empty directory"
-                    ((count++))
-                fi
+                real+=("$entry")
+            fi
+        done
+        (( ${#real[@]} > 0 )) && continue
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_operation "$log_file" "CLEANUP" "$dir" "" "(DRY RUN)"
+            (( ++count ))
+        else
+            (( ${#junk[@]} )) && rm -f -- "${junk[@]}" 2>/dev/null
+            if rmdir "$dir" 2>/dev/null; then
+                log_operation "$log_file" "CLEANUP" "$dir" "" "Removed empty directory"
+                (( ++count ))
             fi
         fi
-    done
-
-    print_success "Cleaned $count empty directories"
-    echo "$count"
+    done < <(find "$source_dir" -mindepth 1 -depth -type d -print0 2>/dev/null)
+    print_success "Carpetas vacías eliminadas: $count"
 }
 
-# Scan all files in source directory
+# Lista (separada por NUL) los archivos a organizar, excluyendo basura del
+# sistema, carpetas _Organized previas y el destino si está dentro del origen.
 scan_files() {
     local source_dir="$1"
+    local -a prune=() skip=()
+    local item
 
-    # Use find with null delimiter for safe handling of special chars
-    find "$source_dir" -type f -print0 2>/dev/null
+    for item in "${SYSTEM_DIRS[@]}"; do prune+=(-name "$item" -o); done
+    if [[ -n "${DEST_ROOT:-}" && "$DEST_ROOT" == "$source_dir"/* ]]; then
+        prune+=(-path "$DEST_ROOT" -o)
+    fi
+    prune[-1]=()   # quitar el último -o
+
+    for item in "${SYSTEM_FILES[@]}"; do skip+=(-not -name "$item"); done
+
+    find "$source_dir" -mindepth 1 \( -type d \( "${prune[@]}" \) -prune \) -o \
+        -type f "${skip[@]}" -print0 2>/dev/null
 }
 
-# ============================================================================
-# Volume Detection
-# ============================================================================
-
-# Detect external volumes mounted in /Volumes/
-# Returns array of volume paths (excluding system volumes)
 detect_external_volumes() {
-    local -a volumes=()
-
-    # List directories in /Volumes excluding system volumes
+    local vol vol_name
     for vol in /Volumes/*(/N); do
-        local vol_name="${vol##*/}"
-
-        # Skip macOS system volumes
-        if [[ "$vol_name" =~ ^(Macintosh HD|Recovery|Preboot|VM|Update|Data)$ ]]; then
+        vol_name="${vol##*/}"
+        if [[ "$vol_name" =~ ^(Macintosh\ HD|Recovery|Preboot|VM|Update|Data|com\.apple\..*)$ ]]; then
             continue
         fi
-
-        # Check if it's a mounted external volume and writable
-        if [[ -d "$vol" && -w "$vol" ]]; then
-            volumes+=("$vol")
-        fi
-    done
-
-    # Return volumes as newline-separated for array assignment
-    for vol in "${volumes[@]}"; do
-        echo "$vol"
+        # No se exige escritura: los discos NTFS se montan como solo lectura
+        # en macOS y siguen siendo un origen válido.
+        [[ -d "$vol" && -r "$vol" ]] && echo "$vol"
     done
 }
 
-# Get volume info (name, path, free space)
 get_volume_info() {
     local vol_path="$1"
     local vol_name="${vol_path##*/}"
     local free_space=$(df -h "$vol_path" 2>/dev/null | awk 'NR==2 {print $4}')
-
-    echo "$vol_name|$vol_path|${free_space:-Unknown}"
+    local ro=""
+    [[ -w "$vol_path" ]] || ro=" (solo lectura)"
+    echo "$vol_name|$vol_path|${free_space:-?}${ro}"
 }
 
-# ============================================================================
-# Disk Space Management
-# ============================================================================
+# Carpeta existente más cercana (para medir espacio de un destino aún no creado).
+nearest_existing_dir() {
+    local p="$1"
+    while [[ -n "$p" && ! -d "$p" ]]; do
+        p="${p:h}"
+    done
+    echo "${p:-/}"
+}
 
-# Get free space in bytes for a path
 get_free_space_bytes() {
-    local path="$1"
-    /bin/df -k "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {print $4 * 1024}'
+    local path=$(nearest_existing_dir "$1")
+    /bin/df -k "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {printf "%.0f", $4 * 1024}'
 }
 
-# Get free space in human readable format
-get_free_space_human() {
-    local path="$1"
-    /bin/df -h "$path" 2>/dev/null | /usr/bin/awk 'NR==2 {print $4}'
+# ¿Están ambas rutas en el mismo sistema de archivos?
+same_filesystem() {
+    local a=$(nearest_existing_dir "$1") b=$(nearest_existing_dir "$2")
+    local -a da db
+    zstat -A da +device -- "$a" 2>/dev/null || return 1
+    zstat -A db +device -- "$b" 2>/dev/null || return 1
+    [[ "${da[1]}" == "${db[1]}" ]]
 }
 
-# Format bytes to human readable
 format_bytes() {
-    local bytes="$1"
-    if [[ $bytes -ge 1099511627776 ]]; then
-        echo "$(( bytes / 1099511627776 )) TB"
-    elif [[ $bytes -ge 1073741824 ]]; then
-        echo "$(( bytes / 1073741824 )) GB"
-    elif [[ $bytes -ge 1048576 ]]; then
-        echo "$(( bytes / 1048576 )) MB"
-    elif [[ $bytes -ge 1024 ]]; then
-        echo "$(( bytes / 1024 )) KB"
+    local bytes="${1:-0}"
+    if (( bytes >= 1099511627776 )); then
+        printf "%.1f TB\n" $(( bytes / 1099511627776.0 ))
+    elif (( bytes >= 1073741824 )); then
+        printf "%.1f GB\n" $(( bytes / 1073741824.0 ))
+    elif (( bytes >= 1048576 )); then
+        printf "%.1f MB\n" $(( bytes / 1048576.0 ))
+    elif (( bytes >= 1024 )); then
+        printf "%.1f KB\n" $(( bytes / 1024.0 ))
     else
         echo "${bytes} B"
     fi
 }
 
-# Estimate total size of files in source directory
 estimate_source_size() {
     local source_dir="$1"
-    local total_size=0
-    local count=0
-
-    while IFS= read -r -d '' file; do
-        total_size=$((total_size + $(get_file_size "$file")))
-        ((count++))
-    done < <(scan_files "$source_dir")
-
-    echo "$total_size"
+    local kb=$(/usr/bin/du -sk "$source_dir" 2>/dev/null | /usr/bin/awk '{print $1}')
+    if [[ -n "$kb" && "$kb" =~ ^[0-9]+$ ]]; then
+        echo $(( kb * 1024 ))
+    else
+        echo "0"
+    fi
 }
 
-# Check if destination has enough space for source files
-check_disk_space() {
-    local source_dir="$1"
-    local dest_dir="$2"
-    local copy_mode="${3:-copy}"
-
-    local free_dest=$(get_free_space_bytes "$dest_dir")
-    local needed=$(estimate_source_size "$source_dir")
-
-    # If move mode, we don't need extra space in destination
-    if [[ "$copy_mode" == "move" ]]; then
-        needed=0
-    fi
-
-    # Safety margin 10%
-    local needed_with_margin=$((needed * 110 / 100))
-
-    if [[ $free_dest -lt $needed_with_margin ]]; then
-        return 1  # Insufficient space
-    fi
-    return 0  # Sufficient space
-}
-
-# Get file size in bytes
 get_file_size() {
-    local filepath="$1"
-    stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null
+    local -a st
+    if zstat -A st +size -- "$1" 2>/dev/null; then
+        echo "${st[1]}"
+    else
+        echo "0"
+    fi
 }
 
-# Get file hash (md5 for compatibility, but jdupes uses its own)
 get_file_hash() {
     local filepath="$1"
-    md5 -q "$filepath" 2>/dev/null
+    md5 -q "$filepath" 2>/dev/null || echo ""
 }
 
-# ============================================================================
-# Phased Processing (for low disk space scenarios)
-# ============================================================================
+# Devuelve un nombre libre en dest_dir. Si ya existe un archivo con el mismo
+# nombre Y el mismo contenido que src_file, devuelve ese nombre (el llamador
+# lo detecta con -f y lo omite). El hash solo se calcula cuando hay colisión.
+generate_unique_name() {
+    local dest_dir="$1"
+    local filename="$2"
+    local src_file="${3:-}"
 
-# Process a chunk of files
-process_chunk() {
-    local -n files_ref=$1
-    local dest_root="$2"
-    local backup_id="$3"
-    local rename_enabled="$4"
-    local copy_mode="${5:-copy}"
-
-    for file in "${files_ref[@]}"; do
-        # Skip if marked as duplicate to remove
-        if is_duplicate_to_remove "$file" "REMOVE_FILES"; then
-            ((STAT_SKIPPED_DUP++))
-            log_operation "$LOG_FILE" "SKIP_DUP" "$file" "" "Duplicate of kept file"
-            continue
-        fi
-
-        # Categorize
-        local category
-        category=$(categorize_file "$file")
-
-        # Determine destination directory
-        local dest_dir
-        dest_dir=$(ensure_dest_dir "$dest_root" "$category" "$backup_id")
-
-        # Determine filename
-        local new_name
-        if [[ "$rename_enabled" == "true" ]]; then
-            new_name=$(determine_filename "$file" "$dest_dir" true)
-            if [[ "$new_name" != "${file##*/}" ]]; then
-                ((STAT_RENAMED++))
-            fi
-        else
-            new_name=$(generate_unique_name "$dest_dir" "${file##*/}" "$file")
-        fi
-
-        local dest_path="$dest_dir/$new_name"
-
-        # Check if already exists at destination (same content)
-        if [[ -f "$dest_path" ]]; then
-            local src_hash dest_hash
-            # Use cached hash from generate_unique_name if available
-            if [[ -n "$SOURCE_HASH" ]]; then
-                src_hash="$SOURCE_HASH"
-            else
-                src_hash=$(get_file_hash "$file")
-            fi
-            dest_hash=$(get_file_hash "$dest_path")
-            if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
-                ((STAT_SKIPPED_EXIST++))
-                log_operation "$LOG_FILE" "SKIP_EXIST" "$file" "$dest_path" "hash=$src_hash"
-                continue
-            fi
-        fi
-
-        # Copy or Move file based on copy_mode
-        local details
-        # Use cached hash if available
-        if [[ -n "$SOURCE_HASH" ]]; then
-            details="hash=$SOURCE_HASH"
-        else
-            details="hash=$(get_file_hash "$file")"
-        fi
-        if [[ "$rename_enabled" == "true" ]]; then
-            local exif_date
-            exif_date=$(get_exif_date "$file" 2>/dev/null || echo "none")
-            details+=" exif=$exif_date"
-        fi
-
-        local action="COPY"
-        local result=0
-        if [[ "$copy_mode" == "move" ]]; then
-            action="MOVE"
-            move_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
-            result=$?
-        else
-            copy_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
-            result=$?
-        fi
-
-        if [[ $result -eq 0 ]]; then
-            ((STAT_COPIED++))
-        else
-            ((STAT_ERRORS++))
-        fi
-    done
-}
-
-# Clean up processed files from source after successful copy
-cleanup_processed_source() {
-    local -n files_ref=$1
-    local source_dir="$2"
-    local log_file="$3"
-    local removed=0
-
-    print_info "Removing processed files from source..." >&2
-
-    for file in "${files_ref[@]}"; do
-        if [[ "$DRY_RUN" == "true" ]]; then
-            log_operation "$log_file" "CLEANUP_SRC" "$file" "" "(DRY RUN)"
-        else
-            if rm -f "$file" 2>/dev/null; then
-                log_operation "$log_file" "CLEANUP_SRC" "$file" "" "Removed after successful copy"
-                ((removed++))
-            fi
-        fi
-    done
-
-    # Clean empty directories in source
-    cleanup_empty_dirs "$source_dir" "$log_file"
-
-    print_success "Removed $removed files from source" >&2
-}
-
-# Organize files in phases when disk space is limited
-organize_files_phased() {
-    local source_dir="$1"
-    local dest_root="$2"
-    local backup_id="$3"
-    local rename_enabled="${4:-true}"
-    local chunk_files="${5:-5000}"
-    local chunk_bytes="${6:-53687091200}"  # 50GB default
-
-    print_section "PHASED PROCESSING (Limited Disk Space)"
-    print_info "Source: $source_dir"
-    print_info "Destination: $dest_root"
-    print_info "Chunk size: $chunk_files files or $(format_bytes $chunk_bytes) per phase"
-
-    # Collect all files first
-    local -a all_files=()
-    print_info "Scanning source directory..."
-
-    while IFS= read -r -d '' file; do
-        all_files+=("$file")
-    done < <(scan_files "$source_dir")
-
-    local total_files=${#all_files[@]}
-    STAT_TOTAL=$total_files
-
-    if [[ $total_files -eq 0 ]]; then
-        print_warn "No files found in source directory"
-        return 0
+    local base="${filename%.*}"
+    local ext="${filename##*.}"
+    if [[ "$base" == "$filename" || -z "$base" ]]; then
+        base="$filename"
+        ext=""
+    else
+        ext=".$ext"
     fi
 
-    print_info "Found $total_files files to process"
+    local candidate="$filename"
+    local counter=1
+    local src_hash="" dest_hash
 
-    # Check EXIF availability if renaming
-    if [[ "$rename_enabled" == "true" ]]; then
-        check_exif_availability "${all_files[@]}"
-    fi
-
-    local processed=0
-    local phase=1
-
-    while [[ $processed -lt $total_files ]]; do
-        print_section "PHASE $phase"
-
-        # Calculate chunk boundaries
-        local remaining=$((total_files - processed))
-        local chunk_end=$((processed + chunk_files))
-        [[ $chunk_end -gt $total_files ]] && chunk_end=$total_files
-
-        # Check space before phase
-        local free_dest=$(get_free_space_bytes "$dest_root")
-        local needed=0
-        for ((i=processed; i<chunk_end; i++)); do
-            needed=$((needed + $(get_file_size "${all_files[i]}")))
-        done
-        needed=$((needed * 110 / 100))  # 10% margin
-
-        local free_dest_human=$(get_free_space_human "$dest_root")
-        local needed_human=$(format_bytes $needed)
-
-        print_info "Free space: $free_dest_human | Needed for this phase: $needed_human"
-
-        if [[ $free_dest -lt $needed ]]; then
-            print_warn "Insufficient space for next chunk!"
-            print_warn "Available: $free_dest_human, Required: $needed_human"
-
-            if [[ "$COPY_MODE" == "copy" ]]; then
-                print_info "Since we're in copy mode, phased processing will DELETE files from SOURCE after each phase to free space."
-                print_warn "This means your source files will be removed as they are copied!"
-                print_info "Alternative: Run the script in 'move' mode, or free space manually."
-                if ! confirm "Continue with phased processing (DELETE source files after copy)?"; then
-                    print_error "Aborted by user"
-                    return 1
-                fi
+    while [[ -e "$dest_dir/$candidate" ]]; do
+        if [[ -n "$src_file" && -f "$dest_dir/$candidate" ]]; then
+            [[ -z "$src_hash" ]] && src_hash=$(get_file_hash "$src_file")
+            dest_hash=$(get_file_hash "$dest_dir/$candidate")
+            if [[ -n "$src_hash" && "$src_hash" == "$dest_hash" ]]; then
+                echo "$candidate"
+                return 0
             fi
         fi
-
-        print_info "Processing files $((processed+1)) to $chunk_end of $total_files"
-
-        # Extract chunk
-        local -a chunk=("${all_files[@]:processed:chunk_end-processed}")
-
-        # Process chunk
-        process_chunk chunk "$dest_root" "$backup_id" "$rename_enabled" "$COPY_MODE"
-
-        # If copy mode: remove processed files from source to free space
-        if [[ "$COPY_MODE" == "copy" ]]; then
-            cleanup_processed_source chunk "$source_dir" "$LOG_FILE"
-        fi
-
-        processed=$chunk_end
-        ((phase++))
-
-        # Show progress
-        show_progress "$processed" "$total_files"
+        candidate="${base}_${counter}${ext}"
+        (( ++counter ))
     done
 
-    printf "\n"
-    print_success "Phased processing complete"
+    echo "$candidate"
 }

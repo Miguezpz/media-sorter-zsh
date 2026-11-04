@@ -2,167 +2,59 @@
 # ============================================================================
 # EXIF Rename - exiftool Integration for Smart Renaming
 # ============================================================================
+#
+# Solo se usa para fotos y videos (ver is_media_category). Documentos, audio y
+# otros conservan su nombre original.
 
-# Extract EXIF DateTimeOriginal from file
-get_exif_date() {
+# Fecha de captura en formato YYYYMMDD_HHMMSS leída de los metadatos, o nada.
+# - DateTimeOriginal: fotos (EXIF)
+# - CreateDate / MediaCreateDate: videos (QuickTime) y algunas fotos
+# QuickTimeUTC convierte las fechas de video (guardadas en UTC) a hora local.
+# Se ignoran fechas vacías o en cero ("0000:00:00 00:00:00").
+get_media_date() {
     local filepath="$1"
-    local date_str
-
-    # Try multiple EXIF tags in order of preference
-    # DateTimeOriginal > CreateDate > ModifyDate > FileModifyDate
-    date_str=$(exiftool -s -s -s \
-        -DateTimeOriginal \
-        -CreateDate \
-        -ModifyDate \
-        -FileModifyDate \
-        "$filepath" 2>/dev/null | head -1)
-
-    if [[ -n "$date_str" && "$date_str" != "-" ]]; then
-        echo "$date_str"
-        return 0
-    fi
-
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[0-9]{8}_[0-9]{6}$ && "$line" != 0000* ]]; then
+            echo "$line"
+            return 0
+        fi
+    done < <(exiftool -q -q -s3 -api QuickTimeUTC -d '%Y%m%d_%H%M%S' \
+        -DateTimeOriginal -CreateDate -MediaCreateDate "$filepath" 2>/dev/null)
     return 1
 }
 
-# Format EXIF date to YYYYMMDD_HHMMSS
-format_exif_date() {
-    local exif_date="$1"
-
-    # EXIF format: "2023:10:25 14:30:05" or "2023:10:25 14:30:05+01:00"
-    # Convert to: "20231025_143005"
-
-    # Remove timezone if present
-    exif_date="${exif_date%%+*}"
-    exif_date="${exif_date%%-*}"  # Handle negative timezone
-
-    # Replace colons and space
-    local formatted="${exif_date//:}"
-    formatted="${formatted/ /_}"
-
-    echo "$formatted"
-}
-
-# Generate new filename based on EXIF date
+# Nombre "YYYYMMDD_HHMMSS.ext" a partir de los metadatos, o falla.
 generate_exif_filename() {
     local filepath="$1"
-    local ext="${filepath##*.}"
-    ext="${ext:l}"
-
-    local exif_date
-    exif_date=$(get_exif_date "$filepath")
-
-    if [[ -n "$exif_date" ]]; then
-        local formatted
-        formatted=$(format_exif_date "$exif_date")
-        echo "${formatted}.${ext}"
-        return 0
-    fi
-
-    return 1
+    local ext="${${filepath:t}##*.}"
+    local media_date
+    media_date=$(get_media_date "$filepath") || return 1
+    echo "${media_date}.${ext:l}"
 }
 
-# Get filesystem modification date as fallback
+# Fecha de modificación del archivo como respaldo: YYYYMMDD_HHMMSS
 get_fs_date() {
-    local filepath="$1"
-    # Format: YYYYMMDD_HHMMSS
-    stat -f "%Sm" -t "%Y%m%d_%H%M%S" "$filepath" 2>/dev/null
+    stat -f "%Sm" -t "%Y%m%d_%H%M%S" "$1" 2>/dev/null
 }
 
-# Generate unique filename in destination directory
-# If src_file is provided, checks for identical content to avoid duplicates
-# Sets global SOURCE_HASH to the source file's hash for reuse
-generate_unique_name() {
-    local dest_dir="$1"
-    local proposed_name="$2"
-    local src_file="${3:-}"  # Optional source file for hash comparison
-    local ext="${proposed_name##*.}"
-    local base="${proposed_name%.*}"
-    local counter=0
-    local final_name="$proposed_name"
-
-    while [[ -e "$dest_dir/$final_name" ]]; do
-        # Check if it's the same file (same content)
-        if [[ -f "$dest_dir/$final_name" && -n "$src_file" ]]; then
-            local src_hash dest_hash
-            src_hash=$(md5 -q "$src_file" 2>/dev/null)
-            dest_hash=$(md5 -q "$dest_dir/$final_name" 2>/dev/null)
-            if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
-                # Same file, we'll skip at higher level
-                SOURCE_HASH="$src_hash"
-                echo "$final_name"
-                return 0
-            fi
-        fi
-
-        counter=$((counter + 1))
-        final_name="${base}_${counter}.${ext}"
-    done
-
-    # Calculate and cache hash for the source file if provided
-    if [[ -n "$src_file" ]]; then
-        SOURCE_HASH=$(md5 -q "$src_file" 2>/dev/null)
-    else
-        SOURCE_HASH=""
-    fi
-
-    echo "$final_name"
-}
-
-# Main function: determine final filename for a file
-# Also sets global SOURCE_HASH for the processed file to avoid recalculation
+# Nombre final (único en dest_dir) para una foto o video:
+# metadatos > fecha de modificación > nombre original.
 determine_filename() {
     local filepath="$1"
     local dest_dir="$2"
-    local use_exif="${3:-true}"
-
-    local original_name="${filepath##*/}"
+    local original_name="${filepath:t}"
     local new_name=""
 
-    if [[ "$use_exif" == "true" ]]; then
-        # Try EXIF-based rename
-        new_name=$(generate_exif_filename "$filepath")
-
-        if [[ -n "$new_name" ]]; then
-            # Ensure uniqueness (pass source file for hash comparison)
-            new_name=$(generate_unique_name "$dest_dir" "$new_name" "$filepath")
-            echo "$new_name"
-            return 0
-        fi
-    fi
-
-    # Fallback: try filesystem date
-    local fs_date
-    fs_date=$(get_fs_date "$filepath")
-    if [[ -n "$fs_date" ]]; then
-        local ext="${original_name##*.}"
-        ext="${ext:l}"
-        new_name="${fs_date}.${ext}"
-        new_name=$(generate_unique_name "$dest_dir" "$new_name" "$filepath")
-        echo "$new_name"
-        return 0
-    fi
-
-    # Last resort: keep original name but ensure uniqueness
-    new_name=$(generate_unique_name "$dest_dir" "$original_name" "$filepath")
-    echo "$new_name"
-    return 0
-}
-
-# Batch check EXIF availability for progress reporting
-check_exif_availability() {
-    local -a files=("$@")
-    local total=${#files[@]}
-    local with_exif=0
-    local without_exif=0
-
-    for f in "${files[@]}"; do
-        if get_exif_date "$f" >/dev/null 2>&1; then
-            ((with_exif++))
+    new_name=$(generate_exif_filename "$filepath")
+    if [[ -z "$new_name" ]]; then
+        local fs_date=$(get_fs_date "$filepath")
+        if [[ -n "$fs_date" && "$original_name" == *.* ]]; then
+            new_name="${fs_date}.${${original_name##*.}:l}"
         else
-            ((without_exif++))
+            new_name="$original_name"
         fi
-    done
+    fi
 
-    print_info "EXIF check: $with_exif/$total files have EXIF dates, $without_exif will use fallback"
+    generate_unique_name "$dest_dir" "$new_name" "$filepath"
 }

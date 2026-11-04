@@ -5,85 +5,61 @@
 
 set -euo pipefail
 
-# Allow passing a custom test root or use default
-TEST_ROOT="${1:-/tmp/file_organizer_test_$(date +%s)}"
+TEST_ROOT="${1:-${TMPDIR:-/tmp}/file_organizer_test_$(date +%s)}"
 SOURCE_DIR="$TEST_ROOT/source"
-DEST_DIR="$TEST_ROOT/dest"
 
-print_info() { printf "\033[36mℹ %s\033[0m\n" "$1"; }
-print_success() { printf "\033[32m✓ %s\033[0m\n" "$1"; }
-print_warn() { printf "\033[33m⚠ %s\033[0m\n" "$1"; }
-
-print_info "Creating test data at: $TEST_ROOT"
-
-# Clean previous environment if exists
 rm -rf "$TEST_ROOT" 2>/dev/null || true
 mkdir -p "$SOURCE_DIR"
-mkdir -p "$DEST_DIR"
 
-# Create source structure simulating multiple phone backups
-mkdir -p "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE"
-mkdir -p "$SOURCE_DIR/iPhone_8_Backup/DCIM/101APPLE"
-mkdir -p "$SOURCE_DIR/Pixel_3_Backup/DCIM/Camera"
-mkdir -p "$SOURCE_DIR/Pixel_3_Backup/Download"
-mkdir -p "$SOURCE_DIR/OldBackup/WhatsApp/Media/WhatsApp Images"
-mkdir -p "$SOURCE_DIR/EmptyFolder1/EmptySubfolder"
-mkdir -p "$SOURCE_DIR/EmptyFolder2"
+S="$SOURCE_DIR"
+mkdir -p "$S/iPhone_8_Backup/DCIM/100APPLE" "$S/iPhone_8_Backup/DCIM/101APPLE" \
+         "$S/Pixel_3_Backup/DCIM/Camera" "$S/Pixel_3_Backup/Download" \
+         "$S/OldBackup/WhatsApp/Media/WhatsApp Images" "$S/OldBackup/WhatsApp/Media/WhatsApp Video" \
+         "$S/EmptyFolder1/EmptySubfolder" "$S/EmptyFolder2" "$S/Rara [1] \$dir"
 
-# Create test files with various extensions
-# Images
-echo "fake jpg content 1" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG"
-echo "fake jpg content 2" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0002.JPG"
-echo "fake heic content" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0003.HEIC"
-echo "fake png content" > "$SOURCE_DIR/Pixel_3_Backup/DCIM/Camera/photo_2023.png"
-echo "fake webp content" > "$SOURCE_DIR/Pixel_3_Backup/DCIM/Camera/screenshot.webp"
+# JPEG real de 1x1 px (para que exiftool pueda escribir metadatos)
+TINY_JPEG='/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA='
+make_jpeg() {
+    local file="$1" date="$2"
+    print -r -- "$TINY_JPEG" | base64 -d > "$file"
+    exiftool -q -overwrite_original -DateTimeOriginal="$date" "$file"
+}
 
-# Duplicate images (same content as IMG_0001.JPG)
-echo "fake jpg content 1" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/101APPLE/IMG_0001_COPY.JPG"
-echo "fake jpg content 1" > "$SOURCE_DIR/OldBackup/WhatsApp/Media/WhatsApp Images/IMG_0001_WHATSAPP.JPG"
+# Imágenes con fecha EXIF real
+make_jpeg "$S/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG" "2023:10:25 14:30:05"
+make_jpeg "$S/iPhone_8_Backup/DCIM/100APPLE/IMG_0002.JPG" "2023:11:01 09:15:30"
+echo "fake heic content" > "$S/iPhone_8_Backup/DCIM/100APPLE/IMG_0003.HEIC"
+echo "fake png content"  > "$S/Pixel_3_Backup/DCIM/Camera/photo_2023.png"
+echo "fake webp content" > "$S/Pixel_3_Backup/DCIM/Camera/screenshot.webp"
 
-# Videos
-echo "fake mov content" > "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/VID_0001.MOV"
-echo "fake mp4 content" > "$SOURCE_DIR/Pixel_3_Backup/DCIM/Camera/video_2023.mp4"
+# Duplicados de IMG_0001.JPG (mismo contenido)
+cp "$S/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG" "$S/iPhone_8_Backup/DCIM/101APPLE/IMG_0001_COPY.JPG"
+cp "$S/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG" "$S/OldBackup/WhatsApp/Media/WhatsApp Images/IMG_0001_WHATSAPP.JPG"
 
-# Duplicate video
-mkdir -p "$SOURCE_DIR/OldBackup/WhatsApp/Media/WhatsApp Video"
-echo "fake mov content" > "$SOURCE_DIR/OldBackup/WhatsApp/Media/WhatsApp Video/VID_0001_COPY.MOV"
+# Videos (+ duplicado)
+echo "fake mov content" > "$S/iPhone_8_Backup/DCIM/100APPLE/VID_0001.MOV"
+echo "fake mp4 content" > "$S/Pixel_3_Backup/DCIM/Camera/video_2023.mp4"
+echo "fake mov content" > "$S/OldBackup/WhatsApp/Media/WhatsApp Video/VID_0001_COPY.MOV"
 
 # Audio
-echo "fake m4a content" > "$SOURCE_DIR/iPhone_8_Backup/Recording.m4a"
-echo "fake mp3 content" > "$SOURCE_DIR/Pixel_3_Backup/Download/song.mp3"
+echo "fake m4a content" > "$S/iPhone_8_Backup/Recording.m4a"
+echo "fake mp3 content" > "$S/Pixel_3_Backup/Download/song.mp3"
 
-# Documents
-echo "fake pdf content" > "$SOURCE_DIR/iPhone_8_Backup/Document.pdf"
-echo "fake txt content" > "$SOURCE_DIR/Pixel_3_Backup/notes.txt"
+# Documentos (no deben renombrarse)
+echo "fake pdf content" > "$S/iPhone_8_Backup/Document.pdf"
+echo "fake txt content" > "$S/Pixel_3_Backup/notes.txt"
+echo "nombre raro"      > "$S/Rara [1] \$dir/Informe (final) *v2*.docx"
 
-# Others
-echo "fake unknown" > "$SOURCE_DIR/OldBackup/random.xyz"
+# Otros (incluye un .tmp legítimo del usuario)
+echo "fake unknown" > "$S/OldBackup/random.xyz"
+echo "user tmp"     > "$S/OldBackup/session.tmp"
 
-# Create a file with EXIF data using exiftool if available
-if command -v exiftool >/dev/null 2>&1; then
-    print_info "Adding EXIF data to test images..."
+# Basura de sistema que NO debe procesarse
+echo "x" > "$S/._IMG_0001.JPG"
+echo "x" > "$S/.DS_Store"
+echo "x" > "$S/EmptyFolder2/.DS_Store"
+mkdir -p "$S/.Trashes/501" "$S/.Spotlight-V100/Store"
+echo "borrado" > "$S/.Trashes/501/deleted.jpg"
+echo "indice"  > "$S/.Spotlight-V100/Store/index.jpg"
 
-    # Add EXIF to a few files
-    exiftool -overwrite_original \
-        -DateTimeOriginal="2023:10:25 14:30:05" \
-        -CreateDate="2023:10:25 14:30:05" \
-        "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0001.JPG" >/dev/null 2>&1
-
-    exiftool -overwrite_original \
-        -DateTimeOriginal="2023:11:01 09:15:30" \
-        -CreateDate="2023:11:01 09:15:30" \
-        "$SOURCE_DIR/iPhone_8_Backup/DCIM/100APPLE/IMG_0002.JPG" >/dev/null 2>&1
-
-    exiftool -overwrite_original \
-        -DateTimeOriginal="2022:05:15 18:45:00" \
-        -CreateDate="2022:05:15 18:45:00" \
-        "$SOURCE_DIR/Pixel_3_Backup/DCIM/Camera/photo_2023.png" >/dev/null 2>&1
-
-    print_success "EXIF data added"
-else
-    print_warn "exiftool not found - EXIF tests will use filesystem dates"
-fi
-
-print_success "Test data created at: $SOURCE_DIR"
+echo "$SOURCE_DIR"

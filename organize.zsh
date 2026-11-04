@@ -4,8 +4,7 @@
 # Main entry point - orchestrates all modules
 # ============================================================================
 
-# Strict mode
-set -euo pipefail
+set -u
 setopt NULL_GLOB
 setopt EXTENDED_GLOB
 
@@ -25,77 +24,75 @@ typeset -g DEST_ROOT=""
 typeset -g BACKUP_ID=""
 typeset -g MODE="full"          # full, duplicates, organize
 typeset -g COPY_MODE="copy"     # copy, move
-typeset -g SOURCE_HASH=""       # cache hash to avoid recalculation
 typeset -g RENAME_ENABLED=true
-typeset -g CLEANUP_ENABLED=true
+typeset -g CLEANUP_ENABLED=true # solo aplica en modo move
 typeset -g DRY_RUN=false
+typeset -g INTERACTIVE=true
 typeset -g LOG_FILE=""
 typeset -g DUP_JSON_FILE=""
-
-# Duplicate tracking arrays
-typeset -ga DUP_GROUPS=()
-typeset -ga KEEP_FILES=()
-typeset -ga REMOVE_FILES=()
+typeset -g DUP_REPORT_FILE=""
 
 # Statistics
 typeset -gi STAT_TOTAL=0
-typeset -gi STAT_PROCESSED=0
 typeset -gi STAT_COPIED=0
 typeset -gi STAT_SKIPPED_DUP=0
 typeset -gi STAT_SKIPPED_EXIST=0
 typeset -gi STAT_RENAMED=0
 typeset -gi STAT_ERRORS=0
+typeset -g  ABORT_REASON=""
+
+die() {
+    print_error "$1"
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Uso:
+  ./organize.zsh                      Asistente interactivo (recomendado)
+  ./organize.zsh --source DIR --dest DIR [opciones]
+
+Opciones:
+  --source DIR          Carpeta o disco de origen
+  --dest DIR            Carpeta de destino (si es igual al origen se usa DIR/_Organized)
+  --backup-id NOMBRE    Subcarpeta de lote dentro de cada categoría (opcional)
+  --mode MODO           full | duplicates | organize   (por defecto: full)
+  --copy | --move       Copiar (por defecto) o mover los archivos
+  --rename | --no-rename    Renombrar fotos/videos por fecha de captura (por defecto: sí)
+  --cleanup | --no-cleanup  Borrar carpetas vacías del origen tras mover (por defecto: sí)
+  --dry-run             Simular sin modificar nada
+  --no-interactive      No hacer preguntas (los duplicados se resuelven automáticamente)
+  -h, --help            Mostrar esta ayuda
+EOF
+}
 
 # ============================================================================
 # Dependency Checking
 # ============================================================================
 
 check_dependencies() {
-    print_section "CHECKING DEPENDENCIES"
+    print_section "VERIFICANDO DEPENDENCIAS"
+    local -a missing=()
+    local dep
 
-    local missing=()
-
-    # Check jdupes
-    if ! command -v jdupes >/dev/null 2>&1; then
-        missing+=("jdupes")
-    else
-        local jdupes_path=$(command -v jdupes)
-        print_success "jdupes found: $jdupes_path"
-    fi
-
-    # Check exiftool
-    if ! command -v exiftool >/dev/null 2>&1; then
-        missing+=("exiftool")
-    else
-        local exiftool_path=$(command -v exiftool)
-        print_success "exiftool found: $exiftool_path"
-    fi
-
-    # Check jq (for JSON parsing)
-    if ! command -v jq >/dev/null 2>&1; then
-        missing+=("jq")
-    else
-        print_success "jq found: $(command -v jq)"
-    fi
+    for dep in jdupes exiftool jq; do
+        if command -v "$dep" >/dev/null 2>&1; then
+            print_success "$dep encontrado"
+        else
+            missing+=("$dep")
+        fi
+    done
+    command -v fzf >/dev/null 2>&1 || print_info "Tip: instala 'fzf' para elegir carpetas más fácilmente."
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        print_warn "Missing dependencies: ${missing[*]}"
-        print_info "Install with: brew install ${missing[*]}"
-
-        if confirm "Install missing dependencies now?"; then
-            if ! command -v brew >/dev/null 2>&1; then
-                print_error "Homebrew no está instalado. Visita https://brew.sh/ para instalarlo primero."
-                exit 1
-            fi
-            brew install "${missing[@]}"
-            print_success "Dependencies installed"
+        print_warn "Faltan dependencias: ${missing[*]}"
+        if [[ "$INTERACTIVE" == "true" ]] && confirm "¿Instalarlas ahora con Homebrew?"; then
+            command -v brew >/dev/null 2>&1 || die "Homebrew no está instalado (https://brew.sh)."
+            brew install "${missing[@]}" || die "No se pudieron instalar las dependencias."
         else
-            print_error "Cannot continue without required dependencies"
-            exit 1
+            die "No se puede continuar sin: ${missing[*]}  (brew install ${missing[*]})"
         fi
     fi
-
-    print_success "All dependencies satisfied"
 }
 
 # ============================================================================
@@ -104,588 +101,403 @@ check_dependencies() {
 
 get_user_config() {
     print_header "FILE ORGANIZER & DUPLICATE FINDER"
-    print_info "macOS M2 Edition - ZSH + jdupes + exiftool"
 
-    # Source directory - with external volume detection
-    print_section "SOURCE DIRECTORY"
+    # 1. Origen
+    print_section "ORIGEN"
     select_source_directory SOURCE_DIR
 
-    # Destination directory
-    print_section "DESTINATION DIRECTORY"
-    read_path "Destination directory" DEST_ROOT
-
-    # Backup identifier
-    print_section "BACKUP IDENTIFIER"
-    print_info "Name for this backup batch (alphanumeric, underscore, dash only)"
-    read_string "Backup ID" BACKUP_ID "" validate_backup_id
-
-    # Operation mode
-    print_section "OPERATION MODE"
-    local mode_options=(
-        "Full Process (Find Duplicates + Organize)"
-        "Find Duplicates Only"
-        "Organize Only (Skip Duplicate Scan)"
+    # 2. Destino
+    print_section "DESTINO"
+    local -a dest_options=(
+        "Dentro del mismo origen (carpeta '_Organized')"
+        "Elegir otra carpeta o disco de destino"
     )
-    local mode_choice
-    mode_choice=$(select_menu "Select mode" "${mode_options[@]}")
+    local dest_choice=$(select_menu "¿Dónde guardar los archivos organizados?" "${dest_options[@]}")
+    if [[ "$dest_choice" == "1" ]]; then
+        DEST_ROOT="$SOURCE_DIR/_Organized"
+        print_success "Destino: $DEST_ROOT"
+    else
+        read_path "Carpeta de destino" DEST_ROOT "" true
+    fi
 
-    case $mode_choice in
+    # 3. Subcarpeta de lote (opcional)
+    print_section "SUBCARPETA DE LOTE (OPCIONAL)"
+    print_info "Por defecto los archivos van directo a su categoría (Imagenes/, Videos/...)."
+    print_info "Si quieres agruparlos bajo un nombre (ej. iPhone_2023), escríbelo; si no, pulsa Enter."
+    while true; do
+        printf "${COLORS[CYAN]}%s ${COLORS[RESET]}Nombre del lote (opcional): " "${SYMBOLS[FILE]}" >&2
+        read -r BACKUP_ID || BACKUP_ID=""
+        BACKUP_ID="${BACKUP_ID// /_}"
+        if [[ -z "$BACKUP_ID" ]] || validate_backup_id "$BACKUP_ID"; then
+            break
+        fi
+        print_error "Usa solo letras, números, guion y guion bajo."
+    done
+    [[ -n "$BACKUP_ID" ]] && print_success "Lote: $BACKUP_ID" || print_info "Sin subcarpeta de lote"
+
+    # 4. Modo de operación
+    print_section "MODO DE OPERACIÓN"
+    local -a mode_options=(
+        "Completo: buscar duplicados y organizar sin ellos"
+        "Solo buscar duplicados (reporte, no copia nada)"
+        "Solo organizar (sin buscar duplicados)"
+    )
+    case $(select_menu "Selecciona el modo" "${mode_options[@]}") in
         1) MODE="full" ;;
         2) MODE="duplicates" ;;
         3) MODE="organize" ;;
     esac
-    print_success "Mode: $MODE"
+    print_success "Modo: $MODE"
 
-    # Options
-    print_section "OPTIONS"
-
-    if confirm "Enable Smart Rename (EXIF dates)?" "Y"; then
-        RENAME_ENABLED=true
-        print_success "Smart Rename: ON"
-    else
-        RENAME_ENABLED=false
-        print_info "Smart Rename: OFF (keep original filenames)"
-    fi
-
+    # 5. Opciones
     if [[ "$MODE" != "duplicates" ]]; then
-        if confirm "Clean empty folders in source after copy?" "Y"; then
-            CLEANUP_ENABLED=true
-            print_success "Cleanup Empty Folders: ON"
+        print_section "OPCIONES"
+        if confirm "¿Renombrar fotos y videos por fecha de captura (YYYYMMDD_HHMMSS)?" "Y"; then
+            RENAME_ENABLED=true
         else
-            CLEANUP_ENABLED=false
-            print_info "Cleanup Empty Folders: OFF"
+            RENAME_ENABLED=false
         fi
-    fi
 
-    # Copy vs Move mode
-    if [[ "$MODE" != "duplicates" ]]; then
-        local copy_mode_options=(
-            "Copy (preserve source, default)"
-            "Move (delete source after successful copy - SAVES SPACE)"
+        local -a copy_mode_options=(
+            "Copiar (el origen queda intacto)"
+            "Mover (libera espacio en el origen)"
         )
-        local copy_mode_choice
-        copy_mode_choice=$(select_menu "Copy or Move mode?" "${copy_mode_options[@]}")
-        case $copy_mode_choice in
+        case $(select_menu "¿Copiar o mover?" "${copy_mode_options[@]}") in
             1) COPY_MODE="copy" ;;
             2) COPY_MODE="move" ;;
         esac
-        print_success "Copy Mode: $COPY_MODE"
+
+        if [[ "$COPY_MODE" == "move" ]]; then
+            if confirm "¿Borrar las carpetas que queden vacías en el origen?" "Y"; then
+                CLEANUP_ENABLED=true
+            else
+                CLEANUP_ENABLED=false
+            fi
+        fi
     fi
 
-    if confirm "Dry Run (preview only, no changes)?" "N"; then
+    if confirm "¿Simulación (dry run: muestra qué haría sin modificar nada)?" "N"; then
         DRY_RUN=true
-        print_warn "DRY RUN MODE ENABLED - No files will be modified"
+        print_warn "MODO SIMULACIÓN ACTIVADO"
     else
         DRY_RUN=false
-        print_info "Live mode - files will be copied"
     fi
 
-    # Summary
-    print_section "CONFIGURATION SUMMARY"
-    printf "  ${COLORS[BOLD]}Source:${COLORS[RESET]}      %s\n" "$SOURCE_DIR"
-    printf "  ${COLORS[BOLD]}Destination:${COLORS[RESET]}  %s\n" "$DEST_ROOT"
-    printf "  ${COLORS[BOLD]}Backup ID:${COLORS[RESET]}     %s\n" "$BACKUP_ID"
-    printf "  ${COLORS[BOLD]}Mode:${COLORS[RESET]}          %s\n" "$MODE"
-    printf "  ${COLORS[BOLD]}Copy Mode:${COLORS[RESET]}      %s\n" "$COPY_MODE"
-    printf "  ${COLORS[BOLD]}Smart Rename:${COLORS[RESET]}    %s\n" "$([[ $RENAME_ENABLED == true ]] && echo ON || echo OFF)"
-    printf "  ${COLORS[BOLD]}Cleanup:${COLORS[RESET]}         %s\n" "$([[ $CLEANUP_ENABLED == true ]] && echo ON || echo OFF)"
-    printf "  ${COLORS[BOLD]}Dry Run:${COLORS[RESET]}         %s\n" "$([[ $DRY_RUN == true ]] && echo ON || echo OFF)"
-
-    # Disk space summary
-    local free_dest=$(get_free_space_human "$DEST_ROOT")
-    printf "  ${COLORS[BOLD]}Free space at dest:${COLORS[RESET]} %s\n" "$free_dest"
-
+    # Resumen
+    print_config_summary
     local est_size=$(estimate_source_size "$SOURCE_DIR")
-    if [[ $est_size -gt 0 ]]; then
-        printf "  ${COLORS[BOLD]}Est. size:${COLORS[RESET]}      %s\n" "$(format_bytes $est_size)"
-        if [[ "$COPY_MODE" == "copy" ]]; then
-            local free_bytes=$(get_free_space_bytes "$DEST_ROOT")
-            local needed_bytes=$((est_size * 110 / 100))
-            if [[ $free_bytes -lt $needed_bytes ]]; then
-                printf "  ${COLORS[RED]}⚠ SPACE WARNING: Phased processing may be needed${COLORS[RESET]}\n"
-            fi
-        fi
-    fi
+    (( est_size > 0 )) && printf "  ${COLORS[BOLD]}Tamaño origen:${COLORS[RESET]}   %s\n" "$(format_bytes $est_size)" >&2
 
-    if ! confirm "Proceed with this configuration?"; then
-        print_info "Cancelled by user"
-        exit 0
-    fi
-
-    # Initialize log file
-    LOG_FILE="$DEST_ROOT/management_log.txt"
-    mkdir -p "$DEST_ROOT"
-    echo "# File Organizer Log - $(date '+%Y-%m-%d %H:%M:%S')" > "$LOG_FILE"
-    echo "# Source: $SOURCE_DIR" >> "$LOG_FILE"
-    echo "# Backup ID: $BACKUP_ID" >> "$LOG_FILE"
-    echo "# Mode: $MODE" >> "$LOG_FILE"
-    echo "---" >> "$LOG_FILE"
-
-    # Temp file for jdupes output
-    DUP_JSON_FILE=$(mktemp /tmp/duplicates_XXXXXX.json)
+    confirm "¿Continuar con esta configuración?" || exit 0
 }
 
-# ============================================================================
-# Duplicate Scanning Phase
-# ============================================================================
-
-run_duplicate_scan() {
-    if [[ "$MODE" == "organize" ]]; then
-        print_info "Skipping duplicate scan (organize-only mode)"
-        return 0
+print_config_summary() {
+    print_section "RESUMEN DE CONFIGURACIÓN"
+    printf "  ${COLORS[BOLD]}Origen:${COLORS[RESET]}          %s\n" "$SOURCE_DIR" >&2
+    printf "  ${COLORS[BOLD]}Destino:${COLORS[RESET]}         %s\n" "$DEST_ROOT" >&2
+    printf "  ${COLORS[BOLD]}Lote:${COLORS[RESET]}            %s\n" "${BACKUP_ID:-(ninguno)}" >&2
+    printf "  ${COLORS[BOLD]}Modo:${COLORS[RESET]}            %s\n" "$MODE" >&2
+    if [[ "$MODE" != "duplicates" ]]; then
+        printf "  ${COLORS[BOLD]}Copiar/Mover:${COLORS[RESET]}    %s\n" "$COPY_MODE" >&2
+        printf "  ${COLORS[BOLD]}Renombrar:${COLORS[RESET]}       %s\n" "$([[ $RENAME_ENABLED == true ]] && echo 'sí (solo fotos/videos)' || echo no)" >&2
     fi
-
-    print_section "DUPLICATE SCANNING"
-
-    scan_duplicates "$SOURCE_DIR" "$DUP_JSON_FILE"
-
-    parse_jdupes_output "$DUP_JSON_FILE" "DUP_GROUPS"
-
-    # Get count
-    local dup_count
-    eval "dup_count=\${#DUP_GROUPS[@]}"
-    if [[ $dup_count -eq 0 ]]; then
-        print_success "No duplicates found"
-        return 0
-    fi
-
-    display_duplicate_report "DUP_GROUPS"
-
-    if [[ "$MODE" == "duplicates" ]]; then
-        # Just report, don't organize
-        print_info "Duplicate-only mode: scan complete"
-        if confirm "Save duplicate report to destination?"; then
-            cp "$DUP_JSON_FILE" "$DEST_ROOT/duplicate_report_$(date '+%Y%m%d_%H%M%S').json"
-            print_success "Report saved"
-        fi
-        return 0
-    fi
-
-    # Resolve duplicates
-    if confirm "Resolve duplicates interactively?" "Y"; then
-        resolve_duplicates_interactive "DUP_GROUPS" "KEEP_FILES" "REMOVE_FILES"
-    else
-        print_info "Auto-resolving: keeping first file in each group"
-        resolve_duplicates_auto "DUP_GROUPS" "KEEP_FILES" "REMOVE_FILES" "first"
-    fi
+    [[ "$DRY_RUN" == "true" ]] && printf "  ${COLORS[BOLD]}Simulación:${COLORS[RESET]}      sí\n" >&2
+    return 0
 }
-
-# ============================================================================
-# File Organization Phase
-# ============================================================================
-
-organize_files() {
-    if [[ "$MODE" == "duplicates" ]]; then
-        return 0
-    fi
-
-    print_section "ORGANIZING FILES"
-
-    # Check disk space first
-    if ! check_disk_space "$SOURCE_DIR" "$DEST_ROOT" "$COPY_MODE"; then
-        print_warn "Insufficient disk space for single-pass operation"
-        print_info "Available: $(get_free_space_human "$DEST_ROOT")"
-        local est_size=$(estimate_source_size "$SOURCE_DIR")
-        print_info "Estimated needed: $(format_bytes $((est_size * 110 / 100))) (with 10% margin)"
-
-        if [[ "$COPY_MODE" == "copy" ]]; then
-            print_info "Enabling phased processing (copy + cleanup source after each phase)..."
-            if ! confirm "Proceed with phased processing?"; then
-                print_info "Operation cancelled"
-                return 0
-            fi
-            organize_files_phased "$SOURCE_DIR" "$DEST_ROOT" "$BACKUP_ID" "$RENAME_ENABLED"
-            return 0
-        else
-            # Move mode on same filesystem - no extra space needed
-            print_info "Move mode on same filesystem - proceeding without extra space"
-        fi
-    fi
-
-    # Collect all files first (for progress bar)
-    local -a all_files=()
-    print_info "Scanning source directory..."
-
-    while IFS= read -r -d '' file; do
-        all_files+=("$file")
-    done < <(scan_files "$SOURCE_DIR")
-
-    STAT_TOTAL=${#all_files[@]}
-    print_info "Found $STAT_TOTAL files to process"
-
-    if [[ $STAT_TOTAL -eq 0 ]]; then
-        print_warn "No files found in source directory"
-        return 0
-    fi
-
-    # Check EXIF availability if renaming
-    if [[ "$RENAME_ENABLED" == "true" ]]; then
-        check_exif_availability "${all_files[@]}"
-    fi
-
-    print_info "Starting organization..."
-    local processed=0
-
-    for file in "${all_files[@]}"; do
-        ((processed++))
-        show_progress "$processed" "$STAT_TOTAL"
-
-        # Skip if marked as duplicate to remove
-        if is_duplicate_to_remove "$file" "REMOVE_FILES"; then
-            ((STAT_SKIPPED_DUP++))
-            log_operation "$LOG_FILE" "SKIP_DUP" "$file" "" "Duplicate of kept file"
-            continue
-        fi
-
-        # Categorize
-        local category
-        category=$(categorize_file "$file")
-
-        # Determine destination directory
-        local dest_dir
-        dest_dir=$(ensure_dest_dir "$DEST_ROOT" "$category" "$BACKUP_ID")
-
-        # Determine filename
-        local new_name
-        if [[ "$RENAME_ENABLED" == "true" ]]; then
-            new_name=$(determine_filename "$file" "$dest_dir" true)
-            if [[ "$new_name" != "${file##*/}" ]]; then
-                ((STAT_RENAMED++))
-            fi
-        else
-            new_name=$(generate_unique_name "$dest_dir" "${file##*/}" "$file")
-        fi
-
-        local dest_path="$dest_dir/$new_name"
-
-        # Check if already exists at destination (same content)
-        if [[ -f "$dest_path" ]]; then
-            local src_hash dest_hash
-            # Use cached hash from generate_unique_name if available
-            if [[ -n "$SOURCE_HASH" ]]; then
-                src_hash="$SOURCE_HASH"
-            else
-                src_hash=$(get_file_hash "$file")
-            fi
-            dest_hash=$(get_file_hash "$dest_path")
-            if [[ "$src_hash" == "$dest_hash" && -n "$src_hash" ]]; then
-                ((STAT_SKIPPED_EXIST++))
-                log_operation "$LOG_FILE" "SKIP_EXIST" "$file" "$dest_path" "hash=$src_hash"
-                continue
-            fi
-        fi
-
-        # Copy or Move file based on COPY_MODE
-        local details
-        # Use cached hash if available
-        if [[ -n "$SOURCE_HASH" ]]; then
-            details="hash=$SOURCE_HASH"
-        else
-            details="hash=$(get_file_hash "$file")"
-        fi
-        if [[ "$RENAME_ENABLED" == "true" ]]; then
-            local exif_date
-            exif_date=$(get_exif_date "$file" 2>/dev/null || echo "none")
-            details+=" exif=$exif_date"
-        fi
-
-        local action="COPY"
-        local result=0
-        if [[ "$COPY_MODE" == "move" ]]; then
-            action="MOVE"
-            move_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
-            result=$?
-        else
-            copy_file "$file" "$dest_path" "$LOG_FILE" "$action" "$details"
-            result=$?
-        fi
-
-        if [[ $result -eq 0 ]]; then
-            ((STAT_COPIED++))
-        else
-            ((STAT_ERRORS++))
-        fi
-    done
-
-    printf "\n"
-    print_success "Organization complete"
-}
-
-# ============================================================================
-# Cleanup Phase
-# ============================================================================
-
-run_cleanup() {
-    if [[ "$CLEANUP_ENABLED" != "true" ]] || [[ "$MODE" == "duplicates" ]]; then
-        return 0
-    fi
-
-    print_section "CLEANUP"
-    cleanup_empty_dirs "$SOURCE_DIR" "$LOG_FILE"
-}
-
-# ============================================================================
-# Final Report
-# ============================================================================
-
-show_final_report() {
-    print_header "OPERATION COMPLETE"
-
-    printf "${COLORS[BOLD]}Statistics:${COLORS[RESET]}\n"
-    printf "  ${COLORS[GREEN]}Files copied:${COLORS[RESET]}        %d\n" "$STAT_COPIED"
-    printf "  ${COLORS[YELLOW]}Duplicates skipped:${COLORS[RESET]}  %d\n" "$STAT_SKIPPED_DUP"
-    printf "  ${COLORS[BLUE]}Already existed:${COLORS[RESET]}      %d\n" "$STAT_SKIPPED_EXIST"
-    printf "  ${COLORS[MAGENTA]}Files renamed:${COLORS[RESET]}       %d\n" "$STAT_RENAMED"
-    printf "  ${COLORS[RED]}Errors:${COLORS[RESET]}               %d\n" "$STAT_ERRORS"
-    printf "\n"
-
-    printf "${COLORS[BOLD]}Output:${COLORS[RESET]}\n"
-    printf "  ${COLORS[CYAN]}Organized files:${COLORS[RESET]}     %s\n" "$DEST_ROOT"
-    printf "  ${COLORS[CYAN]}Log file:${COLORS[RESET]}            %s\n" "$LOG_FILE"
-
-    if [[ -f "$DUP_JSON_FILE" ]]; then
-        printf "  ${COLORS[CYAN]}Duplicate report:${COLORS[RESET]}    %s\n" "$DUP_JSON_FILE"
-    fi
-
-    # Show destination structure
-    print_section "DESTINATION STRUCTURE"
-    if command -v tree >/dev/null 2>&1; then
-        tree -L 3 "$DEST_ROOT" 2>/dev/null | head -50
-    else
-        find "$DEST_ROOT" -maxdepth 3 -type f | head -20 | while read f; do
-            printf "  %s\n" "${f#$DEST_ROOT/}"
-        done
-        local total_files
-        total_files=$(find "$DEST_ROOT" -type f | wc -l | tr -d ' ')
-        printf "  ${COLORS[DIM]}... and $((total_files - 20)) more files${COLORS[RESET]}\n"
-    fi
-
-    print_success "Done! Your files are organized at: $DEST_ROOT"
-}
-
-# ============================================================================
-# Argument Parsing (for non-interactive mode)
-# ============================================================================
-
-typeset -g INTERACTIVE=true
 
 parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --source)
-                SOURCE_DIR="$2"
-                shift 2
-                ;;
-            --dest)
-                DEST_ROOT="$2"
-                shift 2
-                ;;
-            --backup-id)
-                BACKUP_ID="$2"
-                shift 2
-                ;;
-            --mode)
-                MODE="$2"
-                shift 2
-                ;;
-            --dry-run)
-                DRY_RUN=true
-                shift
-                ;;
-            --move)
-                COPY_MODE="move"
-                shift
-                ;;
-            --copy)
-                COPY_MODE="copy"
-                shift
-                ;;
-            --no-interactive)
-                INTERACTIVE=false
-                shift
-                ;;
-            --rename)
-                RENAME_ENABLED=true
-                shift
-                ;;
-            --no-rename)
-                RENAME_ENABLED=false
-                shift
-                ;;
-            --cleanup)
-                CLEANUP_ENABLED=true
-                shift
-                ;;
-            --no-cleanup)
-                CLEANUP_ENABLED=false
-                shift
-                ;;
-            --help|-h)
-                cat <<EOF
-Usage: organize.zsh [options]
-
-Options:
-  --source DIR          Source directory
-  --dest DIR            Destination directory
-  --backup-id NAME      Backup identifier
-  --mode MODE           Mode: full, duplicates, organize
-  --dry-run             Preview only, no changes
-  --move                Move files instead of copying (deletes source after copy)
-  --copy                Copy files (default, preserves source)
-  --no-interactive      Run without prompts (requires all args)
-  --rename              Enable EXIF renaming
-  --no-rename           Disable EXIF renaming
-  --cleanup             Enable empty folder cleanup
-  --no-cleanup          Disable empty folder cleanup
-  --help                Show this help
-
-Interactive mode (default): Run without arguments for guided setup.
-EOF
-                exit 0
-                ;;
+    while (( $# > 0 )); do
+        case "$1" in
+            --source|--dest|--backup-id|--mode)
+                [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "Falta el valor para $1"
+                case "$1" in
+                    --source)    SOURCE_DIR="$2" ;;
+                    --dest)      DEST_ROOT="$2" ;;
+                    --backup-id) BACKUP_ID="$2" ;;
+                    --mode)      MODE="$2" ;;
+                esac
+                shift 2 ;;
+            --dry-run)        DRY_RUN=true; shift ;;
+            --move)           COPY_MODE="move"; shift ;;
+            --copy)           COPY_MODE="copy"; shift ;;
+            --rename)         RENAME_ENABLED=true; shift ;;
+            --no-rename)      RENAME_ENABLED=false; shift ;;
+            --cleanup)        CLEANUP_ENABLED=true; shift ;;
+            --no-cleanup)     CLEANUP_ENABLED=false; shift ;;
+            --no-interactive) INTERACTIVE=false; shift ;;
+            -h|--help)        usage; exit 0 ;;
             *)
-                print_error "Unknown option: $1"
-                exit 1
-                ;;
+                print_error "Opción desconocida: $1"
+                usage >&2
+                exit 1 ;;
         esac
     done
 }
 
 validate_config() {
-    local errors=0
+    [[ -n "$SOURCE_DIR" ]] || die "Falta el origen (--source)."
+    [[ -n "$DEST_ROOT" ]]  || die "Falta el destino (--dest)."
 
-    if [[ -z "$SOURCE_DIR" ]]; then
-        print_error "Source directory not specified"
-        ((errors++))
-    elif [[ ! -d "$SOURCE_DIR" ]]; then
-        print_error "Source directory does not exist: $SOURCE_DIR"
-        ((errors++))
+    SOURCE_DIR=$(normalize_path_input "$SOURCE_DIR")
+    DEST_ROOT=$(normalize_path_input "$DEST_ROOT")
+    [[ -d "$SOURCE_DIR" ]] || die "El origen no existe o no es una carpeta: $SOURCE_DIR"
+
+    SOURCE_DIR="${SOURCE_DIR:A}"
+    DEST_ROOT="${DEST_ROOT:A}"
+
+    case "$MODE" in
+        full|duplicates|organize) ;;
+        *) die "Modo inválido: '$MODE' (usa full, duplicates u organize)" ;;
+    esac
+
+    BACKUP_ID="${BACKUP_ID// /_}"
+    if [[ -n "$BACKUP_ID" ]] && ! validate_backup_id "$BACKUP_ID"; then
+        die "Nombre de lote inválido: '$BACKUP_ID' (solo letras, números, - y _)"
     fi
 
-    if [[ -z "$DEST_ROOT" ]]; then
-        print_error "Destination directory not specified"
-        ((errors++))
+    # Origen y destino iguales: organizar dentro de una subcarpeta del origen
+    if [[ "$DEST_ROOT" == "$SOURCE_DIR" ]]; then
+        DEST_ROOT="$SOURCE_DIR/_Organized"
+        print_info "Origen y destino son iguales; se usará: $DEST_ROOT"
     fi
 
-    if [[ -z "$BACKUP_ID" ]]; then
-        print_error "Backup ID not specified"
-        ((errors++))
-    elif ! validate_backup_id "$BACKUP_ID"; then
-        print_error "Invalid backup ID (alphanumeric, underscore, dash only)"
-        ((errors++))
+    if [[ "$SOURCE_DIR/" == "$DEST_ROOT/"* ]]; then
+        die "El origen no puede estar dentro del destino."
     fi
 
-    if [[ ! "$MODE" =~ ^(full|duplicates|organize)$ ]]; then
-        print_error "Invalid mode: $MODE (must be full, duplicates, or organize)"
-        ((errors++))
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # La simulación no debe crear nada en el destino: el log va a un temporal.
+        LOG_FILE=$(mktemp -t media-sorter-dryrun) || die "No se pudo crear el log temporal."
+    else
+        mkdir -p "$DEST_ROOT" 2>/dev/null || die "No se pudo crear el destino: $DEST_ROOT"
+        [[ -w "$DEST_ROOT" ]] || die "No hay permiso de escritura en el destino: $DEST_ROOT"
+        LOG_FILE="$DEST_ROOT/management_log.txt"
     fi
+    {
+        echo "# ===== $(date '+%Y-%m-%d %H:%M:%S') ====="
+        echo "# Origen: $SOURCE_DIR"
+        echo "# Destino: $DEST_ROOT"
+        echo "# Modo: $MODE | $COPY_MODE | rename=$RENAME_ENABLED | dry_run=$DRY_RUN"
+    } >> "$LOG_FILE"
 
-    # Convert to absolute paths
-    SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
-    DEST_ROOT="$(mkdir -p "$DEST_ROOT" && cd "$DEST_ROOT" && pwd)"
-
-    # Validate source and destination are not the same or nested
-    local abs_source="${SOURCE_DIR%/}/"
-    local abs_dest="${DEST_ROOT%/}/"
-
-    if [[ "$abs_dest" == "$abs_source"* ]]; then
-        print_error "Destination cannot be inside source directory"
-        print_error "  Source:      $SOURCE_DIR"
-        print_error "  Destination: $DEST_ROOT"
-        ((errors++))
-    elif [[ "$abs_source" == "$abs_dest"* && "$abs_source" != "$abs_dest" ]]; then
-        print_error "Source cannot be inside destination directory"
-        print_error "  Source:      $SOURCE_DIR"
-        print_error "  Destination: $DEST_ROOT"
-        ((errors++))
-    elif [[ "$abs_source" == "$abs_dest" ]]; then
-        print_error "Source and destination cannot be the same directory"
-        print_error "  Path: $abs_source"
-        ((errors++))
-    fi
-
-    # Check if same filesystem
-    local src_dev=$(stat -f "%d" "$abs_source" 2>/dev/null || echo "")
-    local dest_dev=$(stat -f "%d" "$abs_dest" 2>/dev/null || echo "")
-    if [[ -n "$src_dev" && -n "$dest_dev" && "$src_dev" == "$dest_dev" ]]; then
-        print_warn "Source and destination are on the same filesystem"
-        print_warn "Moving files will be fast (rename), but copying will use extra space"
-        if ! confirm "Continue with same filesystem?"; then
-            ((errors++))
-        fi
-    fi
-
-    if [[ $errors -gt 0 ]]; then
-        exit 1
-    fi
-
-    # Initialize log file
-    LOG_FILE="$DEST_ROOT/management_log.txt"
-    mkdir -p "$DEST_ROOT"
-    echo "# File Organizer Log - $(date '+%Y-%m-%d %H:%M:%S')" > "$LOG_FILE"
-    echo "# Source: $SOURCE_DIR" >> "$LOG_FILE"
-    echo "# Backup ID: $BACKUP_ID" >> "$LOG_FILE"
-    echo "# Mode: $MODE" >> "$LOG_FILE"
-    echo "---" >> "$LOG_FILE"
-
-    # Temp file for jdupes output
-    DUP_JSON_FILE=$(mktemp /tmp/duplicates_XXXXXX.json)
+    DUP_REPORT_FILE="${LOG_FILE:h}/duplicados_$(date '+%Y%m%d_%H%M%S').txt"
+    DUP_JSON_FILE=$(mktemp -t media-sorter-dups) || die "No se pudo crear un archivo temporal."
 }
 
 # ============================================================================
-# Main
+# Pipeline
 # ============================================================================
 
-main() {
-    # Handle Ctrl+C gracefully
-    trap 'print_error "Interrupted"; exit 130' INT
+run_duplicate_scan() {
+    [[ "$MODE" == "organize" ]] && return 0
+    print_section "BUSCANDO DUPLICADOS"
 
-    # Parse arguments
-    parse_args "$@"
-
-    # If running interactively (no args or --no-interactive not set)
-    if [[ $# -eq 0 ]] || [[ "${INTERACTIVE:-true}" == "true" ]]; then
-        if [[ -z "$SOURCE_DIR" ]]; then
-            check_dependencies
-            get_user_config
-            # Validate config after interactive input
-            validate_config
-        else
-            # Non-interactive but args provided
-            validate_config
-            check_dependencies
-            print_section "CONFIGURATION"
-            printf "  ${COLORS[BOLD]}Source:${COLORS[RESET]}      %s\n" "$SOURCE_DIR"
-            printf "  ${COLORS[BOLD]}Destination:${COLORS[RESET]}  %s\n" "$DEST_ROOT"
-            printf "  ${COLORS[BOLD]}Backup ID:${COLORS[RESET]}     %s\n" "$BACKUP_ID"
-            printf "  ${COLORS[BOLD]}Mode:${COLORS[RESET]}          %s\n" "$MODE"
-            printf "  ${COLORS[BOLD]}Smart Rename:${COLORS[RESET]}    %s\n" "$([[ $RENAME_ENABLED == true ]] && echo ON || echo OFF)"
-            printf "  ${COLORS[BOLD]}Cleanup:${COLORS[RESET]}         %s\n" "$([[ $CLEANUP_ENABLED == true ]] && echo ON || echo OFF)"
-            printf "  ${COLORS[BOLD]}Dry Run:${COLORS[RESET]}         %s\n" "$([[ $DRY_RUN == true ]] && echo ON || echo OFF)"
+    if ! scan_duplicates "$SOURCE_DIR" "$DUP_JSON_FILE"; then
+        [[ "$MODE" == "duplicates" ]] && die "No se pudo completar la búsqueda de duplicados."
+        if [[ "$INTERACTIVE" == "true" ]] && confirm "¿Continuar organizando SIN omitir duplicados?" "N"; then
+            return 0
         fi
-    else
-        # Non-interactive mode
-        validate_config
-        check_dependencies
+        die "Operación cancelada: falló la búsqueda de duplicados."
     fi
 
-    local start_time
-    start_time=$(date +%s)
+    parse_jdupes_output "$DUP_JSON_FILE"
+    if (( ${#DUP_GROUPS[@]} == 0 )); then
+        print_success "No se encontraron duplicados"
+        return 0
+    fi
 
+    display_duplicate_report "$DUP_REPORT_FILE"
+    [[ "$MODE" == "duplicates" ]] && return 0
+
+    if [[ "$INTERACTIVE" == "true" ]] && confirm "¿Elegir manualmente qué copia conservar en cada grupo? (No = usar la sugerencia)" "N"; then
+        if ! resolve_duplicates_interactive; then
+            print_warn "Operación cancelada por el usuario."
+            exit 0
+        fi
+    else
+        resolve_duplicates_auto
+    fi
+    print_info "Se omitirán ${#REMOVE_FILES[@]} copias duplicadas (se conserva una de cada grupo)."
+}
+
+organize_files() {
+    [[ "$MODE" == "duplicates" ]] && return 0
+    print_section "ORGANIZANDO ARCHIVOS"
+
+    local -a all_files=()
+    local file
+    print_info "Escaneando el origen..."
+    while IFS= read -r -d '' file; do
+        all_files+=("$file")
+    done < <(scan_files "$SOURCE_DIR")
+
+    STAT_TOTAL=${#all_files[@]}
+    print_info "Archivos encontrados: $STAT_TOTAL"
+    (( STAT_TOTAL == 0 )) && return 0
+
+    # Espacio necesario: solo lo que realmente se va a copiar.
+    # Mover dentro del mismo disco no ocupa espacio adicional.
+    local -i needed=0
+    if ! [[ "$COPY_MODE" == "move" ]] || ! same_filesystem "$SOURCE_DIR" "$DEST_ROOT"; then
+        local -a st
+        for file in "${all_files[@]}"; do
+            is_duplicate_to_remove "$file" && continue
+            zstat -A st +size -- "$file" 2>/dev/null && (( needed += st[1] ))
+        done
+    fi
+    local -i free_dest=$(get_free_space_bytes "$DEST_ROOT")
+    local -i needed_with_margin=$(( needed + needed / 20 ))   # +5 % de margen
+    if (( needed_with_margin > free_dest )); then
+        local msg="Espacio insuficiente en el destino: se necesitan $(format_bytes $needed_with_margin) y hay $(format_bytes $free_dest) libres."
+        if [[ "$DRY_RUN" == "true" ]]; then
+            print_warn "$msg (simulación: se continúa igualmente)"
+        else
+            print_error "$msg"
+            if [[ "$COPY_MODE" == "copy" ]] && same_filesystem "$SOURCE_DIR" "$DEST_ROOT"; then
+                print_info "Sugerencia: origen y destino están en el mismo disco; usa el modo Mover (--move), que no necesita espacio extra."
+            fi
+            ABORT_REASON="espacio insuficiente en el destino"
+            return 1
+        fi
+    else
+        print_info "Espacio necesario: $(format_bytes $needed) · libre: $(format_bytes $free_dest)"
+    fi
+
+    cleanup_temp_files "$DEST_ROOT" "$LOG_FILE"
+
+    local category="" rel_path="" rel_dir="" dest_dir="" new_name="" dest_path="" orig_name="" action=""
+    local -i idx=0 result=0
+    action="COPY"; [[ "$COPY_MODE" == "move" ]] && action="MOVE"
+
+    init_progress
+    for (( idx=1; idx<=STAT_TOTAL; idx++ )); do
+        file="${all_files[idx]}"
+        show_progress "$idx" "$STAT_TOTAL"
+
+        if is_duplicate_to_remove "$file"; then
+            (( ++STAT_SKIPPED_DUP ))
+            log_operation "$LOG_FILE" "SKIP_DUP" "$file" "" "duplicate"
+            continue
+        fi
+
+        categorize_file "$file" category
+
+        # Se conserva la estructura de carpetas original dentro de cada categoría
+        rel_path="${file#$SOURCE_DIR/}"
+        rel_dir=""
+        [[ "$rel_path" == */* ]] && rel_dir="${rel_path%/*}"
+
+        dest_dir="$DEST_ROOT/$category"
+        [[ -n "$BACKUP_ID" ]] && dest_dir+="/$BACKUP_ID"
+        [[ -n "$rel_dir" ]] && dest_dir+="/$rel_dir"
+
+        if [[ "$DRY_RUN" != "true" && ! -d "$dest_dir" ]]; then
+            if ! mkdir -p "$dest_dir" 2>/dev/null; then
+                log_operation "$LOG_FILE" "ERROR" "$file" "$dest_dir" "mkdir failed"
+                (( ++STAT_ERRORS ))
+                continue
+            fi
+        fi
+
+        orig_name="${file:t}"
+        if [[ "$RENAME_ENABLED" == "true" ]] && is_media_category "$category"; then
+            new_name=$(determine_filename "$file" "$dest_dir")
+        else
+            new_name=$(generate_unique_name "$dest_dir" "$orig_name" "$file")
+        fi
+        [[ -z "$new_name" ]] && new_name="$orig_name"
+        dest_path="$dest_dir/$new_name"
+
+        # generate_unique_name solo devuelve un nombre existente si el contenido es idéntico
+        if [[ -f "$dest_path" ]]; then
+            (( ++STAT_SKIPPED_EXIST ))
+            log_operation "$LOG_FILE" "SKIP_EXIST" "$file" "$dest_path" "identical file already in destination"
+            continue
+        fi
+
+        result=0
+        if [[ "$COPY_MODE" == "move" ]]; then
+            move_file "$file" "$dest_path" "$LOG_FILE" "$action" "" || result=$?
+        else
+            copy_file "$file" "$dest_path" "$LOG_FILE" "$action" "" || result=$?
+        fi
+
+        if (( result == 0 )); then
+            (( ++STAT_COPIED ))
+            [[ "$new_name" != "$orig_name" ]] && (( ++STAT_RENAMED ))
+        else
+            (( ++STAT_ERRORS ))
+        fi
+    done
+    finish_progress
+    return 0
+}
+
+run_cleanup() {
+    [[ "$CLEANUP_ENABLED" == "true" && "$COPY_MODE" == "move" && "$MODE" != "duplicates" ]] || return 0
+    [[ -n "$ABORT_REASON" ]] && return 0
+    print_section "LIMPIEZA"
+    cleanup_empty_dirs "$SOURCE_DIR" "$LOG_FILE"
+}
+
+show_final_report() {
+    local verb="copiados"
+    [[ "$COPY_MODE" == "move" ]] && verb="movidos"
+    [[ "$DRY_RUN" == "true" ]] && verb+=" (simulado)"
+
+    print_header "RESULTADO"
+    if [[ "$MODE" == "duplicates" ]]; then
+        printf "\n  ${COLORS[BOLD]}Duplicados:${COLORS[RESET]}\n" >&2
+        printf "  %-28s %d\n" "Grupos encontrados:" "${#DUP_GROUPS[@]}" >&2
+        printf "  %-28s %s\n" "Espacio recuperable:" "$(format_bytes $DUP_WASTED_BYTES)" >&2
+        (( ${#DUP_GROUPS[@]} > 0 )) && printf "  %-28s %s\n" "Reporte:" "$DUP_REPORT_FILE" >&2
+    else
+        printf "\n  ${COLORS[BOLD]}Estadísticas:${COLORS[RESET]}\n" >&2
+        printf "  ${COLORS[GREEN]}%-28s${COLORS[RESET]} %d\n" "Archivos $verb:" "$STAT_COPIED" >&2
+        printf "  ${COLORS[YELLOW]}%-28s${COLORS[RESET]} %d\n" "Duplicados omitidos:" "$STAT_SKIPPED_DUP" >&2
+        printf "  ${COLORS[BLUE]}%-28s${COLORS[RESET]} %d\n" "Ya existían en destino:" "$STAT_SKIPPED_EXIST" >&2
+        printf "  ${COLORS[MAGENTA]}%-28s${COLORS[RESET]} %d\n" "Renombrados por fecha:" "$STAT_RENAMED" >&2
+        printf "  ${COLORS[RED]}%-28s${COLORS[RESET]} %d\n" "Errores:" "$STAT_ERRORS" >&2
+    fi
+    printf "\n" >&2
+
+    if [[ -n "$ABORT_REASON" ]]; then
+        print_error "No se organizó nada: $ABORT_REASON."
+    elif (( STAT_ERRORS > 0 )); then
+        print_warn "Terminado con $STAT_ERRORS errores. Revisa el log: $LOG_FILE"
+    elif [[ "$DRY_RUN" == "true" ]]; then
+        print_success "Simulación terminada: no se modificó nada. Detalle en: $LOG_FILE"
+    else
+        print_success "Proceso terminado correctamente. Log: $LOG_FILE"
+    fi
+}
+
+main() {
+    trap 'finish_progress 2>/dev/null; print_error "Interrumpido"; exit 130' INT
+
+    if (( $# == 0 )); then
+        [[ -t 0 ]] || die "El modo interactivo necesita una terminal. Usa --help para el modo por argumentos."
+        check_dependencies
+        get_user_config
+    else
+        parse_args "$@"
+        [[ -t 0 ]] || INTERACTIVE=false
+        check_dependencies
+    fi
+    validate_config
+    (( $# > 0 )) && print_config_summary
+
+    local start_time=$SECONDS
     run_duplicate_scan
     organize_files
     run_cleanup
-
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
     show_final_report
-    print_info "Total time: ${duration}s"
+    print_info "Tiempo total: $(( SECONDS - start_time ))s"
 
-    # Cleanup temp file
     [[ -f "$DUP_JSON_FILE" ]] && rm -f "$DUP_JSON_FILE"
+    [[ -n "$ABORT_REASON" ]] && exit 1
+    (( STAT_ERRORS > 0 )) && exit 2
+    exit 0
 }
 
-# Run main
 main "$@"
